@@ -45,8 +45,8 @@ requirements.md          Dependency and upstream setup notes
 
 ```bash
 # Clone the repository
-git clone --recursive <GAFU_REPOSITORY_URL>
-cd gafu
+git clone --recursive https://github.com/LRuca/GAFU.git
+cd GAFU
 
 # Install the shared environment and upstream source trees
 bash scripts/install.sh
