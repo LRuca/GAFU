@@ -1,0 +1,2809 @@
+#!/usr/bin/env python3
+"""GAFU BAGEL paper-main Stage 2 trainer.
+
+The release entry point injects every language layer specified by the paper.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import io
+import json
+import math
+import os
+import random
+import shutil
+import sys
+import tempfile
+import time
+from array import array
+from bisect import bisect_left, bisect_right
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager, nullcontext
+from pathlib import Path
+from typing import Any
+
+import torch
+import torch.distributed as dist
+import torch.nn.functional as F
+import pyarrow.parquet as pq
+from PIL import Image
+from safetensors.torch import load_file, save_file
+from torch import nn
+from torch.nn.parallel import DistributedDataParallel
+from torch.utils.checkpoint import checkpoint as torch_checkpoint
+from torchvision.transforms import functional as TF
+
+WIDTH = 3584
+WORK_WIDTH = 1024
+TOKENS = 256
+BF16 = torch.bfloat16
+SAMPLER_LAYERS = tuple(range(27))
+RATING_FIELDS = (
+    "visual_dependency_ratings",
+    "image_correspondence_ratings",
+    "relevance_ratings",
+)
+LOSS_SCALE = 1.0
+LAMBDA_META = 0.5
+ARCHITECTURE_ID = "gafu_paper_main_bagel_v1"
+CHECKPOINT_SCHEMA = "gafu_paper_main_bagel_checkpoint_v1"
+RUN_SCHEMA = "gafu_paper_main_bagel_run_v1"
+
+
+class InstructionManifest:
+    def __init__(self, path: str, image_root_from: str = "", image_root_to: str = "") -> None:
+        self.path = Path(path)
+        self.image_root_from = image_root_from.rstrip("/")
+        self.image_root_to = image_root_to.rstrip("/")
+        self.offsets: list[int] = []
+        with self.path.open("rb") as handle:
+            while True:
+                offset = handle.tell()
+                line = handle.readline()
+                if not line:
+                    break
+                if line.strip():
+                    self.offsets.append(offset)
+        if not self.offsets:
+            raise RuntimeError(f"empty manifest: {self.path}")
+        self._handle = None
+
+    def __len__(self) -> int:
+        return len(self.offsets)
+
+    def get(self, index: int) -> dict[str, Any]:
+        if self._handle is None:
+            self._handle = self.path.open("rb")
+        self._handle.seek(self.offsets[index % len(self.offsets)])
+        row = json.loads(self._handle.readline())
+        conversations = row.get("conversations", [])
+        human = next((x for x in conversations if x.get("from") in {"human", "user"}), None)
+        assistant = next((x for x in conversations if x.get("from") in {"gpt", "assistant"}), None)
+        prompt = str(row.get("question", row.get("prompt", human.get("value", "") if human else "")))
+        target = str(row.get("answer", row.get("fullAnswer", assistant.get("value", "") if assistant else "")))
+        prompt = prompt.replace("<image>", "").strip()
+        target = target.strip()
+        image_path = str(row.get("image", row.get("image_path", "")))
+        if self.image_root_from and image_path.startswith(self.image_root_from + "/"):
+            image_path = self.image_root_to + image_path[len(self.image_root_from):]
+        if not prompt or not target or not image_path:
+            raise ValueError(f"invalid caption row: {row.get('id')}")
+        return {
+            "id": str(row.get("id", index)),
+            "image_path": image_path,
+            "prompt": prompt,
+            "answer": target,
+            "caption_words": len(target.split()),
+        }
+
+
+class FineVisionManifest:
+    """Lazy row access for FineVision Parquet shards with embedded image bytes."""
+
+    def __init__(self, manifest_path: str) -> None:
+        self.manifest_path = Path(manifest_path)
+        payload = json.loads(self.manifest_path.read_text(encoding="utf-8"))
+        base = self.manifest_path.parent
+        self.files: list[tuple[Path, int]] = []
+        for item in payload.get("files", []):
+            path = base / item["path"]
+            if not path.exists():
+                path = base.parent / item["path"]
+            if "text_only" in path.parts or not path.exists():
+                continue
+            self.files.append((path, int(item["rows"])))
+        if not self.files:
+            raise RuntimeError(f"no FineVision Parquet shards in {self.manifest_path}")
+        self.ends: list[int] = []
+        total = 0
+        for _, rows in self.files:
+            total += rows
+            self.ends.append(total)
+        self._file_index: int | None = None
+        self._parquet: pq.ParquetFile | None = None
+        self._row_group: int | None = None
+        self._table: Any = None
+
+    def __len__(self) -> int:
+        return self.ends[-1]
+
+    def _row(self, index: int) -> dict[str, Any]:
+        index %= len(self)
+        file_index = bisect_right(self.ends, index)
+        start = 0 if file_index == 0 else self.ends[file_index - 1]
+        local_index = index - start
+        path, _ = self.files[file_index]
+        if self._file_index != file_index:
+            self._file_index = file_index
+            self._parquet = pq.ParquetFile(path)
+            self._row_group = None
+        assert self._parquet is not None
+        group_start = 0
+        for group_index in range(self._parquet.num_row_groups):
+            group_rows = self._parquet.metadata.row_group(group_index).num_rows
+            if local_index < group_start + group_rows:
+                if self._row_group != group_index:
+                    self._row_group = group_index
+                    self._table = self._parquet.read_row_group(group_index)
+                assert self._table is not None
+                row_index = local_index - group_start
+                return {
+                    name: self._table[name][row_index].as_py()
+                    for name in self._table.column_names
+                }
+            group_start += group_rows
+        raise IndexError(index)
+
+    def get(self, index: int) -> dict[str, Any]:
+        row = self._row(index)
+        images = row.get("images") or []
+        texts = row.get("texts") or []
+        if not images or not texts:
+            raise ValueError(f"invalid FineVision row {index}")
+        ratings = {field: row.get(field) for field in RATING_FIELDS}
+        if any(values is None or len(values) != len(texts) for values in ratings.values()):
+            raise ValueError(f"FineVision rating alignment mismatch at row {index}")
+        selected: tuple[str, str, int] | None = None
+        for turn_index, turn in enumerate(texts):
+            user = str((turn or {}).get("user", "")).replace("<image>", "").strip()
+            assistant = str((turn or {}).get("assistant", "")).strip()
+            if user and assistant:
+                selected = (user, assistant, turn_index)
+        if selected is None:
+            raise ValueError(f"FineVision row {index} has no user/assistant turn")
+        prompt, answer, turn_index = selected
+        image_bytes = (images[0] or {}).get("bytes")
+        if not image_bytes:
+            raise ValueError(f"FineVision row {index} has no embedded image bytes")
+        result = {
+            "id": f"finevision-{index}",
+            "image_bytes": image_bytes,
+            "prompt": prompt,
+            "answer": answer,
+            "caption_words": len(answer.split()),
+            "visual_dependency": int(ratings["visual_dependency_ratings"][turn_index]),
+            "image_correspondence": int(ratings["image_correspondence_ratings"][turn_index]),
+            "relevance": int(ratings["relevance_ratings"][turn_index]),
+            "turn_index": turn_index,
+        }
+        if row.get("donor_index") is not None:
+            result["donor_index"] = int(row["donor_index"])
+        if row.get("toy_code") is not None:
+            result["toy_code"] = str(row["toy_code"])
+        if row.get("donor_code") is not None:
+            result["donor_code"] = str(row["donor_code"])
+        return result
+
+
+def load_manifest(
+    path: str, image_root_from: str = "", image_root_to: str = "",
+) -> InstructionManifest | FineVisionManifest:
+    if Path(path).name == "DATASET_MANIFEST.json":
+        return FineVisionManifest(path)
+    return InstructionManifest(path, image_root_from, image_root_to)
+
+
+def image_source(row: dict[str, Any]) -> str | bytes | bytearray:
+    if "image_bytes" in row:
+        return row["image_bytes"]
+    return row["image_path"]
+
+
+def correspondence_gate(rating: int) -> float:
+    if rating <= 2:
+        return 0.0
+    if rating == 3:
+        return 0.5
+    return 1.0
+
+
+def metadata_weight(row: dict[str, Any]) -> float:
+    visual_score = (int(row["visual_dependency"]) - 1) / 4.0
+    return 1.0 + LAMBDA_META * visual_score * correspondence_gate(
+        int(row["image_correspondence"]),
+    )
+
+
+def token_cross_entropy(
+    lm_head: nn.Module,
+    selected_hidden: torch.Tensor,
+    labels: torch.Tensor,
+    chunk_size: int | None = None,
+) -> torch.Tensor:
+    if chunk_size is None or selected_hidden.shape[0] <= chunk_size:
+        return F.cross_entropy(lm_head(selected_hidden), labels, reduction="none")
+    return torch.cat([
+        F.cross_entropy(lm_head(hidden_chunk), label_chunk, reduction="none")
+        for hidden_chunk, label_chunk in zip(
+            selected_hidden.split(chunk_size),
+            labels.split(chunk_size),
+            strict=True,
+        )
+    ])
+
+
+def select_rows(
+    manifest: InstructionManifest | FineVisionManifest,
+    base_serial: int,
+    mix_a: int,
+    mix_b: int,
+    micro_batch_size: int,
+    max_answer_words: int,
+    max_microbatch_words: int,
+) -> tuple[list[dict[str, Any]], int]:
+    selected: list[dict[str, Any]] = []
+    total_words = 0
+    cursor = base_serial
+    scanned = 0
+    while len(selected) < micro_batch_size:
+        row = manifest.get((mix_a * cursor + mix_b) % len(manifest))
+        cursor += 1
+        scanned += 1
+        words = int(row["caption_words"])
+        if words > max_answer_words:
+            continue
+        if selected and total_words + words > max_microbatch_words:
+            continue
+        selected.append(row)
+        total_words += words
+        if scanned > len(manifest):
+            raise RuntimeError("caption budget cannot form a microbatch")
+    return selected, scanned - len(selected)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--manifest", required=True)
+    parser.add_argument("--val-manifest", required=True)
+    parser.add_argument("--flexae-checkpoint", required=True)
+    parser.add_argument("--flexae-root", required=True)
+    parser.add_argument("--bagel-root", required=True)
+    parser.add_argument("--bagel-model", required=True)
+    parser.add_argument("--bagel-plugins", required=True)
+    parser.add_argument("--legacy-scripts", required=True)
+    parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--stage", choices=("stage2",), required=True)
+    parser.add_argument("--init-bridge-checkpoint", default=None)
+    parser.add_argument("--image-root-from", default="")
+    parser.add_argument("--image-root-to", default="")
+    parser.add_argument("--max-steps", type=int, required=True)
+    parser.add_argument("--micro-batch-size", type=int, default=1)
+    parser.add_argument("--mask-u-prob", type=float, default=0.0)
+    parser.add_argument("--mask-u-schedule", default="")
+    parser.add_argument("--mask-u-schedule-boundaries", default="")
+    parser.add_argument("--mask-u-schedule-horizon", type=int, default=None)
+    parser.add_argument(
+        "--mask-u-granularity",
+        choices=("per_sample_per_vit_token", "per_sample_whole_u"),
+        default="per_sample_per_vit_token",
+    )
+    parser.add_argument("--gradient-accumulation", type=int, default=4)
+    parser.add_argument("--g-pair-loss-weight", type=float, default=0.0)
+    parser.add_argument("--g-pair-temperature", type=float, default=0.07)
+    parser.add_argument("--answer-use-loss-weight", type=float, default=0.0)
+    parser.add_argument("--real-ce-loss-weight", type=float, default=5.0)
+    parser.add_argument("--answer-use-beta", type=float, default=0.1)
+    parser.add_argument("--real-drop-loss-weight", type=float, default=0.0)
+    parser.add_argument("--real-shuffle-loss-weight", type=float, default=1.0)
+    parser.add_argument("--dpo-real-weight", type=float, default=4.0)
+    parser.add_argument("--dpo-negative-weight", type=float, default=1.0)
+    parser.add_argument("--dpo-negative-grad-cap", type=float, default=0.25)
+    parser.add_argument(
+        "--answer-use-reference",
+        choices=("zero_delta",),
+        default="zero_delta",
+    )
+    parser.add_argument("--shuffle-kl-weight", type=float, default=0.0)
+    parser.add_argument("--drop-kl-weight", type=float, default=0.0)
+    parser.add_argument("--shuffle-kl-schedule-steps", default="")
+    parser.add_argument("--shuffle-kl-schedule-weights", default="")
+    parser.add_argument("--train-kl-chunk-size", type=int, default=32)
+    parser.add_argument("--projector-lr", type=float, default=2e-5)
+    parser.add_argument("--fuser-lr", type=float, default=2e-5)
+    parser.add_argument("--sampler-lr", type=float, default=2e-5)
+    parser.add_argument("--lora-lr", type=float, default=1e-4)
+    parser.add_argument("--extractor-lr", type=float, default=1e-4)
+    parser.add_argument("--lora-rank", type=int, default=16)
+    parser.add_argument("--lora-alpha", type=float, default=16.0)
+    parser.add_argument("--lora-master-dtype", choices=("bf16", "fp32"), default="bf16")
+    parser.add_argument("--bridge-master-dtype", choices=("bf16", "fp32"), default="bf16")
+    parser.add_argument("--warmup-steps", type=int, default=500)
+    parser.add_argument("--min-lr-ratio", type=float, default=0.1)
+    parser.add_argument("--max-grad-norm", type=float, default=1.0)
+    parser.add_argument("--logging-steps", type=int, default=10)
+    parser.add_argument("--save-steps", type=int, default=200)
+    parser.add_argument("--val-limit", type=int, default=8)
+    parser.add_argument("--final-val-limit", type=int, default=None)
+    parser.add_argument("--val-batch-size", type=int, default=2)
+    parser.add_argument("--max-answer-words", type=int, default=256)
+    parser.add_argument("--max-microbatch-words", type=int, default=300)
+    parser.add_argument("--max-prompt-tokens", type=int, default=512)
+    parser.add_argument("--max-packed-tokens", type=int, default=None)
+    parser.add_argument("--prefetch-workers", type=int, default=2)
+    parser.add_argument("--balanced-order", default=None)
+    parser.add_argument("--encoder-unfreeze-step", type=int, default=2501)
+    parser.add_argument("--tower-handoff-dtype", choices=("fp32", "bf16"), default="fp32")
+    parser.add_argument("--activation-checkpoint", action="store_true")
+    parser.add_argument("--fused-adamw", action="store_true")
+    parser.add_argument("--schedule-max-steps", type=int, default=None)
+    parser.add_argument("--resume-ramp-start-step", type=int, default=None)
+    parser.add_argument("--resume-ramp-steps", type=int, default=0)
+    parser.add_argument("--gradient-audit-steps", default="")
+    parser.add_argument("--gradient-audit-dir", default=None)
+    parser.add_argument("--mix-seed", type=int, default=20260808)
+    parser.add_argument("--seed", type=int, default=20260808)
+    parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--keep-latest", type=int, default=2)
+    return parser.parse_args()
+
+
+def parse_mask_u_schedule(
+    values_text: str,
+    boundaries_text: str,
+    max_steps: int,
+) -> tuple[tuple[float, ...], tuple[int, ...]] | None:
+    if not values_text and not boundaries_text:
+        return None
+    if not values_text or not boundaries_text:
+        raise ValueError("mask-U schedule values and boundaries must be provided together")
+    values = tuple(float(value.strip()) for value in values_text.split(",") if value.strip())
+    boundaries = tuple(int(value.strip()) for value in boundaries_text.split(",") if value.strip())
+    if not values or len(values) != len(boundaries):
+        raise ValueError("mask-U schedule values and boundaries must have equal non-zero lengths")
+    if any(not 0.0 <= value <= 1.0 for value in values):
+        raise ValueError(f"mask-U schedule probabilities must be in [0, 1]: {values}")
+    if any(boundary < 1 for boundary in boundaries):
+        raise ValueError(f"mask-U schedule boundaries must be positive: {boundaries}")
+    if any(left >= right for left, right in zip(boundaries, boundaries[1:])):
+        raise ValueError(f"mask-U schedule boundaries must be strictly increasing: {boundaries}")
+    if boundaries[-1] != max_steps:
+        raise ValueError(
+            f"final mask-U schedule boundary must equal max_steps: {boundaries[-1]} != {max_steps}"
+        )
+    return values, boundaries
+
+
+def mask_u_probability_for_step(
+    step: int,
+    schedule: tuple[tuple[float, ...], tuple[int, ...]] | None,
+    fallback: float,
+) -> float:
+    if schedule is None:
+        return fallback
+    values, boundaries = schedule
+    index = bisect_left(boundaries, step)
+    if index >= len(values):
+        raise ValueError(f"step {step} exceeds mask-U schedule ending at {boundaries[-1]}")
+    return values[index]
+
+
+def parse_shuffle_kl_schedule(
+    steps_text: str,
+    weights_text: str,
+    max_steps: int,
+) -> tuple[tuple[int, ...], tuple[float, ...]] | None:
+    if not steps_text and not weights_text:
+        return None
+    if not steps_text or not weights_text:
+        raise ValueError("shuffle KL schedule steps and weights must be provided together")
+    steps = tuple(int(value.strip()) for value in steps_text.split(",") if value.strip())
+    weights = tuple(float(value.strip()) for value in weights_text.split(",") if value.strip())
+    if len(steps) != len(weights) or len(steps) < 2:
+        raise ValueError("shuffle KL schedule requires equal-length steps and weights with at least two knots")
+    if steps[0] != 1 or steps[-1] != max_steps:
+        raise ValueError(f"shuffle KL schedule must span steps 1..{max_steps}: {steps}")
+    if any(left >= right for left, right in zip(steps, steps[1:])):
+        raise ValueError(f"shuffle KL schedule steps must be strictly increasing: {steps}")
+    if any(weight < 0.0 for weight in weights):
+        raise ValueError(f"shuffle KL schedule weights must be non-negative: {weights}")
+    return steps, weights
+
+
+def piecewise_shuffle_kl_weight_for_step(
+    step: int,
+    schedule: tuple[tuple[int, ...], tuple[float, ...]],
+) -> float:
+    steps, weights = schedule
+    if step <= steps[0]:
+        return weights[0]
+    if step >= steps[-1]:
+        return weights[-1]
+    left = bisect_right(steps, step) - 1
+    alpha = (step - steps[left]) / (steps[left + 1] - steps[left])
+    return weights[left] + alpha * (weights[left + 1] - weights[left])
+
+
+def sha256(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def load_pil(value: str | bytes | bytearray) -> Image.Image:
+    stream = io.BytesIO(value) if isinstance(value, (bytes, bytearray)) else value
+    with Image.open(stream) as source:
+        return source.convert("RGB")
+
+
+def vae_tensor(value: Image.Image) -> torch.Tensor:
+    return TF.pil_to_tensor(value.resize((512, 512), Image.Resampling.BICUBIC)).float().div_(127.5).sub_(1.0)
+
+
+def atomic_jsonl(path: Path, payload: dict[str, Any]) -> None:
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, sort_keys=True) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def token_id(new_token_ids: dict[str, Any], key: str) -> int:
+    value = new_token_ids[key]
+    return int(value.item()) if torch.is_tensor(value) else int(value)
+
+
+def cosine_lr_factor(
+    step: int, warmup_steps: int, schedule_max_steps: int, min_lr_ratio: float,
+) -> float:
+    if step < warmup_steps:
+        return max(1e-8, (step + 1) / max(1, warmup_steps))
+    progress = (step - warmup_steps) / max(1, schedule_max_steps - warmup_steps)
+    return min_lr_ratio + (1 - min_lr_ratio) * 0.5 * (
+        1 + math.cos(math.pi * min(1.0, progress))
+    )
+
+
+def resumed_lr_factor(
+    step: int,
+    warmup_steps: int,
+    schedule_max_steps: int,
+    min_lr_ratio: float,
+    ramp_start_step: int | None,
+    ramp_steps: int,
+) -> float:
+    target = cosine_lr_factor(step, warmup_steps, schedule_max_steps, min_lr_ratio)
+    if ramp_start_step is None or not (ramp_start_step < step <= ramp_start_step + ramp_steps):
+        return target
+    alpha = (step - ramp_start_step) / ramp_steps
+    return min_lr_ratio + alpha * (target - min_lr_ratio)
+
+
+class GlobalConditionedResidualAdapter(nn.Module):
+    def __init__(self, bottleneck: int = WORK_WIDTH) -> None:
+        super().__init__()
+        self.norm = nn.RMSNorm(WIDTH, eps=1e-6)
+        self.down = nn.Linear(WIDTH, bottleneck, bias=False)
+        self.context = nn.Linear(bottleneck, bottleneck, bias=True)
+        self.up = nn.Linear(bottleneck, WIDTH, bias=False)
+
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        hidden = F.gelu(self.down(self.norm(tokens)), approximate="tanh")
+        gate = 1.0 + torch.tanh(self.context(hidden.mean(1, keepdim=True)))
+        return tokens + self.up(hidden * gate)
+
+
+class GProjector(nn.Module):
+    """Trainable projector whose initial mapping is exactly raw_g -> raw_g."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.calibrator = nn.Linear(WIDTH, WIDTH, bias=True)
+        self.adapter = GlobalConditionedResidualAdapter(WORK_WIDTH)
+        with torch.no_grad():
+            self.calibrator.weight.copy_(torch.eye(WIDTH))
+            self.calibrator.bias.zero_()
+            self.adapter.up.weight.zero_()
+
+    def forward(self, raw_g: torch.Tensor) -> torch.Tensor:
+        return self.adapter(self.calibrator(raw_g))
+
+
+class GlobalAttentionBase(nn.Module):
+    """Global attention over all 256 G tokens, with no positional bias."""
+
+    def __init__(self) -> None:
+        super().__init__()
+
+    def global_attention(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        batch, query_len, _ = q.shape
+        if k.shape[:2] != (batch, TOKENS) or v.shape[:2] != (batch, TOKENS):
+            raise ValueError(f"expected K/V [B,{TOKENS},D], got {tuple(k.shape)}/{tuple(v.shape)}")
+        q = q.view(batch, query_len, 16, 64).transpose(1, 2)
+        k = k.view(batch, TOKENS, 16, 64).transpose(1, 2)
+        v = v.view(batch, TOKENS, 16, 64).transpose(1, 2)
+        mixed = F.scaled_dot_product_attention(
+            q, k, v, attn_mask=None, dropout_p=0.0, is_causal=False,
+        )
+        return mixed.transpose(1, 2).reshape(batch, query_len, WORK_WIDTH)
+
+
+def smooth_bidirectional_pair_score(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    temperature: float,
+) -> torch.Tensor:
+    """Score Q/K compatibility using the projections that drive cross-attention."""
+    if q.ndim != 3 or k.ndim != 3 or q.shape[0] != k.shape[0]:
+        raise ValueError(f"invalid pair-score shapes: q={tuple(q.shape)} k={tuple(k.shape)}")
+    if q.shape[-1] != WORK_WIDTH or k.shape[-1] != WORK_WIDTH:
+        raise ValueError(f"pair-score width must be {WORK_WIDTH}")
+    if temperature <= 0.0:
+        raise ValueError("pair-score temperature must be positive")
+    batch, q_len, _ = q.shape
+    k_len = k.shape[1]
+    q_heads = q.reshape(batch, q_len, 16, 64).transpose(1, 2)
+    k_heads = k.reshape(batch, k_len, 16, 64).transpose(1, 2)
+    q_heads = F.normalize(q_heads.float(), dim=-1)
+    k_heads = F.normalize(k_heads.float(), dim=-1)
+    similarity = torch.matmul(q_heads, k_heads.transpose(-1, -2)) / temperature
+    q_to_k = torch.logsumexp(similarity, dim=-1) - math.log(k_len)
+    k_to_q = torch.logsumexp(similarity, dim=-2) - math.log(q_len)
+    return 0.5 * (q_to_k.mean(dim=(-1, -2)) + k_to_q.mean(dim=(-1, -2)))
+
+
+def pairwise_logistic_loss(real_score: torch.Tensor, shuffled_score: torch.Tensor) -> torch.Tensor:
+    if real_score.shape != shuffled_score.shape:
+        raise ValueError(
+            f"pair-score shape mismatch: real={tuple(real_score.shape)} "
+            f"shuffled={tuple(shuffled_score.shape)}"
+        )
+    return F.softplus(shuffled_score - real_score).mean()
+
+
+def answer_use_copo_loss(
+    real_ce: torch.Tensor,
+    shuffled_ce: torch.Tensor,
+    beta: float,
+    reference_gap: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Increase matched-G answer advantage relative to a fixed reference gap."""
+    if real_ce.shape != shuffled_ce.shape:
+        raise ValueError(
+            f"answer-use CE shape mismatch: real={tuple(real_ce.shape)} "
+            f"shuffle={tuple(shuffled_ce.shape)}"
+        )
+    if beta <= 0.0:
+        raise ValueError("answer-use beta must be positive")
+    if reference_gap is None:
+        reference_gap = torch.zeros_like(real_ce)
+    if reference_gap.shape != real_ce.shape:
+        raise ValueError("answer-use reference gap shape mismatch")
+    current_gap = shuffled_ce - real_ce
+    return F.softplus(-beta * (current_gap - reference_gap)).mean()
+
+
+def dpo_branch_coefficient(
+    preferred_ce: torch.Tensor,
+    negative_ce: torch.Tensor,
+    beta: float,
+) -> torch.Tensor:
+    """Return detached dDPO/d(preferred CE) magnitude for branch decomposition."""
+    if preferred_ce.shape != negative_ce.shape:
+        raise ValueError("DPO branch CE shape mismatch")
+    return beta * torch.sigmoid(-beta * (negative_ce - preferred_ce)).detach()
+
+
+def cap_gradient_relative_to(
+    gradient: torch.Tensor,
+    reference: torch.Tensor,
+    cap_ratio: float,
+) -> tuple[torch.Tensor, float]:
+    """Cap one auxiliary branch by the norm of its paired real branch."""
+    if cap_ratio < 0.0:
+        raise ValueError("gradient cap ratio must be non-negative")
+    gradient_norm = gradient.float().norm()
+    reference_norm = reference.float().norm()
+    scale = min(
+        1.0,
+        cap_ratio * float(reference_norm) / max(float(gradient_norm), 1e-12),
+    )
+    return gradient * scale, scale
+
+
+def gradient_buffer_cap_scale(
+    gradient: list[torch.Tensor],
+    reference: list[torch.Tensor],
+    cap_ratio: float,
+) -> float:
+    """Compute the same global-norm cap without concatenating full buffers."""
+    if cap_ratio < 0.0:
+        raise ValueError("gradient cap ratio must be non-negative")
+    if len(gradient) != len(reference):
+        raise ValueError("gradient cap buffer length mismatch")
+    gradient_sq = math.fsum(float(value.float().norm()) ** 2 for value in gradient)
+    reference_sq = math.fsum(float(value.float().norm()) ** 2 for value in reference)
+    gradient_norm = math.sqrt(gradient_sq)
+    reference_norm = math.sqrt(reference_sq)
+    return min(1.0, cap_ratio * reference_norm / max(gradient_norm, 1e-12))
+
+
+def sync_gradient(
+    gradient: torch.Tensor,
+    world_size: int,
+) -> torch.Tensor:
+    """Match DDP's averaged-gradient semantics for autograd.grad branches."""
+    # Keep only the short-lived all-reduced tensor on GPU. Accumulating five
+    # full branch gradients on GPU exceeds the old A100 single-real path.
+    result = gradient.detach()
+    if world_size > 1:
+        dist.all_reduce(result, op=dist.ReduceOp.SUM)
+        result.div_(world_size)
+    cpu_result = result.float().cpu()
+    del result
+    return cpu_result
+
+
+def sync_gradients_bucketed(
+    gradients: tuple[torch.Tensor | None, ...],
+    parameters: list[nn.Parameter],
+    world_size: int,
+    bucket_bytes: int = 64 * 1024 * 1024,
+) -> list[torch.Tensor]:
+    """All-reduce manual branch gradients in bounded buckets.
+
+    DDP normally buckets parameter gradients, but manual autograd branches do
+    not enter DDP's reducer. One all-reduce per parameter creates excessive
+    NCCL launch latency, so pack bounded FP32 buckets and immediately move
+    each reduced bucket to the CPU accumulator.
+    """
+    if len(gradients) != len(parameters):
+        raise ValueError("gradient and parameter lists must have equal length")
+    results: list[torch.Tensor | None] = [None] * len(parameters)
+    bucket: list[tuple[int, torch.Tensor | None, int]] = []
+    bucket_numel = 0
+    max_numel = max(1, bucket_bytes // 4)
+
+    def flush() -> None:
+        nonlocal bucket, bucket_numel
+        if not bucket:
+            return
+        device = next(
+            (value.device for _, value, _ in bucket if value is not None),
+            parameters[bucket[0][0]].device,
+        )
+        flat = torch.zeros(bucket_numel, device=device, dtype=torch.float32)
+        offset = 0
+        for index, value, size in bucket:
+            if value is not None:
+                flat[offset:offset + size].copy_(value.detach().float().reshape(-1))
+            offset += size
+        if world_size > 1:
+            dist.all_reduce(flat, op=dist.ReduceOp.SUM)
+            flat.div_(world_size)
+        offset = 0
+        for index, value, size in bucket:
+            results[index] = flat[offset:offset + size].cpu()
+            offset += size
+            gradients_list[index] = None
+        del flat
+        bucket = []
+        bucket_numel = 0
+
+    # Keep the list mutable so processed autograd tensors can be released
+    # before the next bucket is allocated.
+    gradients_list = list(gradients)
+    for index, (value, parameter) in enumerate(zip(gradients_list, parameters, strict=True)):
+        size = parameter.numel()
+        if bucket and bucket_numel + size > max_numel:
+            flush()
+        bucket.append((index, value, size))
+        bucket_numel += size
+    flush()
+    return [
+        (value if value is not None else torch.zeros(parameter.numel(), dtype=torch.float32))
+        .view_as(parameter)
+        for value, parameter in zip(results, parameters, strict=True)
+    ]
+
+
+def all_reduce_branch_buffers_bucketed(
+    branch_buffers: dict[str, list[torch.Tensor]],
+    parameters: list[nn.Parameter],
+    world_size: int,
+    device: torch.device,
+    bucket_bytes: int = 256 * 1024 * 1024,
+) -> None:
+    """Reduce accumulated objective and negative branches in one pass.
+
+    Manual autograd branches are accumulated locally during gradient
+    accumulation. Packing all branches for a parameter bucket into one
+    collective avoids synchronizing every branch on every micro-step while
+    preserving the global-gradient semantics needed by the cap calculation.
+    """
+    if world_size <= 1:
+        return
+    names = tuple(branch_buffers)
+    if not names:
+        raise ValueError("at least one gradient branch is required")
+    max_numel = max(1, bucket_bytes // 4)
+    bucket: list[tuple[int, int]] = []
+    bucket_numel = 0
+
+    def flush() -> None:
+        nonlocal bucket, bucket_numel
+        if not bucket:
+            return
+        flat = torch.empty(len(names) * bucket_numel, device=device, dtype=torch.float32)
+        for branch_index, name in enumerate(names):
+            offset = branch_index * bucket_numel
+            for index, size in bucket:
+                flat[offset:offset + size].copy_(branch_buffers[name][index].reshape(-1))
+                offset += size
+        dist.all_reduce(flat, op=dist.ReduceOp.SUM)
+        flat.div_(world_size)
+        for branch_index, name in enumerate(names):
+            offset = branch_index * bucket_numel
+            for index, size in bucket:
+                branch_buffers[name][index].copy_(
+                    flat[offset:offset + size].cpu().view_as(branch_buffers[name][index])
+                )
+                offset += size
+        del flat
+        bucket = []
+        bucket_numel = 0
+
+    for index, parameter in enumerate(parameters):
+        size = parameter.numel()
+        if bucket and bucket_numel + size > max_numel:
+            flush()
+        bucket.append((index, size))
+        bucket_numel += size
+    flush()
+
+
+def forward_kl_per_token(
+    current_logits: torch.Tensor,
+    reference_logits: torch.Tensor,
+) -> torch.Tensor:
+    """Per-token KL(reference || current), with no reference gradient."""
+    if current_logits.shape != reference_logits.shape or current_logits.ndim != 2:
+        raise ValueError(
+            f"logit shape mismatch: current={tuple(current_logits.shape)} "
+            f"reference={tuple(reference_logits.shape)}"
+        )
+    reference_log_probs = F.log_softmax(reference_logits.detach().float(), dim=-1)
+    reference_probs = reference_log_probs.exp()
+    current_log_probs = F.log_softmax(current_logits.float(), dim=-1)
+    return (reference_probs * (reference_log_probs - current_log_probs)).sum(dim=-1)
+
+
+def forward_kl_loss(
+    current_logits: torch.Tensor,
+    reference_logits: torch.Tensor,
+) -> torch.Tensor:
+    return forward_kl_per_token(current_logits, reference_logits).mean()
+
+
+def forward_kl_from_hidden(
+    lm_head: nn.Module,
+    current_hidden: torch.Tensor,
+    reference_hidden: torch.Tensor,
+    chunk_size: int = 8,
+) -> torch.Tensor:
+    """Compute exact token KL while bounding full-vocabulary activation memory."""
+    if current_hidden.shape != reference_hidden.shape or current_hidden.ndim != 2:
+        raise ValueError("hidden shape mismatch for chunked KL")
+    if chunk_size <= 0:
+        raise ValueError("KL chunk size must be positive")
+    chunks = []
+    for start in range(0, current_hidden.shape[0], chunk_size):
+        stop = min(start + chunk_size, current_hidden.shape[0])
+        current_logits = lm_head(current_hidden[start:stop])
+        reference_logits = lm_head(reference_hidden[start:stop])
+        chunks.append(forward_kl_per_token(current_logits, reference_logits))
+        del current_logits, reference_logits
+    return torch.cat(chunks)
+
+
+def trainable_named_parameters(model: nn.Module) -> dict[str, nn.Parameter]:
+    named = {
+        f"bridge.{name}": parameter
+        for name, parameter in model.bridge.named_parameters()
+    }
+    named.update({
+        f"lora.{name}": parameter
+        for name, parameter in understanding_lora_named_parameters(model.bagel)
+    })
+    return named
+
+
+@contextmanager
+def use_reference_parameters(
+    model: nn.Module,
+    reference_state: dict[str, torch.Tensor],
+):
+    """Temporarily swap only bridge/LoRA tensors without duplicating BAGEL."""
+    named = trainable_named_parameters(model)
+    if set(named) != set(reference_state):
+        raise RuntimeError(
+            f"reference state mismatch: missing={sorted(set(named) - set(reference_state))[:3]} "
+            f"unexpected={sorted(set(reference_state) - set(named))[:3]}"
+        )
+    current = {
+        name: parameter.detach().clone()
+        for name, parameter in named.items()
+    }
+    with torch.no_grad():
+        for name, parameter in named.items():
+            parameter.copy_(reference_state[name].to(parameter.device, parameter.dtype))
+    try:
+        yield
+    finally:
+        with torch.no_grad():
+            for name, parameter in named.items():
+                parameter.copy_(current[name])
+
+
+@contextmanager
+def disable_understanding_lora(bagel: nn.Module):
+    modules = [module for module in bagel.modules() if isinstance(module, UnderstandingLoRALinear)]
+    scales = [module.scale for module in modules]
+    for module in modules:
+        module.scale = 0.0
+    try:
+        yield
+    finally:
+        for module, scale in zip(modules, scales, strict=True):
+            module.scale = scale
+
+
+class EntrySpatialFuser(GlobalAttentionBase):
+    """Flamingo-style gated cross-attention from raw U queries into projected G."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.u_norm = nn.RMSNorm(WIDTH, eps=1e-6)
+        self.g_norm = nn.RMSNorm(WIDTH, eps=1e-6)
+        self.q = nn.Linear(WIDTH, WORK_WIDTH, bias=False)
+        self.k = nn.Linear(WIDTH, WORK_WIDTH, bias=False)
+        self.v = nn.Linear(WIDTH, WORK_WIDTH, bias=False)
+        self.out = nn.Linear(WORK_WIDTH, WIDTH, bias=False)
+        self.gate = nn.Parameter(torch.zeros(()))
+
+    def forward(self, u: torch.Tensor, projected_g: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        g = self.g_norm(projected_g)
+        mixed = self.global_attention(self.q(self.u_norm(u)), self.k(g), self.v(g))
+        delta = torch.tanh(self.gate) * self.out(mixed)
+        return u + delta, delta
+
+
+class TextHiddenGSampler(GlobalAttentionBase):
+    """Use contextual frozen-LLM language states as queries into G memory."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.h_norm = nn.RMSNorm(WIDTH, eps=1e-6)
+        self.g_norm = nn.RMSNorm(WIDTH, eps=1e-6)
+        self.z_norm = nn.RMSNorm(WORK_WIDTH, eps=1e-6)
+        self.q = nn.Linear(WIDTH, WORK_WIDTH, bias=False)
+        self.k = nn.Linear(WIDTH, WORK_WIDTH, bias=False)
+        self.v = nn.Linear(WIDTH, WORK_WIDTH, bias=False)
+        self.o = nn.Linear(WORK_WIDTH, WORK_WIDTH, bias=False)
+        self.mid = nn.Linear(WORK_WIDTH, WORK_WIDTH, bias=False)
+        self.up = nn.Linear(WORK_WIDTH, WIDTH, bias=False)
+        nn.init.zeros_(self.up.weight)
+
+    def forward(
+        self, hidden: torch.Tensor, projected_g: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        q = self.q(self.h_norm(hidden))
+        g = self.g_norm(projected_g)
+        k = self.k(g)
+        attended = self.o(self.global_attention(q, k, self.v(g)))
+        middle = F.gelu(self.mid(self.z_norm(attended)), approximate="tanh")
+        delta = self.up(middle)
+        return hidden + delta, delta, q, k
+
+
+class Stage3Bridge(nn.Module):
+    def __init__(self, pair_temperature: float) -> None:
+        super().__init__()
+        if pair_temperature <= 0.0:
+            raise ValueError("pair temperature must be positive")
+        self.pair_temperature = float(pair_temperature)
+        self.projector = GProjector()
+        self.deep_samplers = nn.ModuleList([
+            TextHiddenGSampler() for _ in SAMPLER_LAYERS
+        ])
+        self._context: tuple[list[torch.Tensor], torch.Tensor, bool] | None = None
+        self._capture_pair_scores = False
+        self.last_entry_ratio = 0.0
+        self.last_deep_ratios = [0.0] * len(SAMPLER_LAYERS)
+        self.last_deep_queries: list[list[torch.Tensor] | None] = [None] * len(SAMPLER_LAYERS)
+        self.last_deep_pair_scores: list[torch.Tensor | None] = [None] * len(SAMPLER_LAYERS)
+
+    def begin(
+        self,
+        u: torch.Tensor,
+        raw_g: torch.Tensor,
+        language_indexes: list[torch.Tensor],
+        use_entry_g: bool,
+        use_deep_g: bool,
+        position_embedding: torch.Tensor,
+        capture_pair_scores: bool = False,
+    ) -> torch.Tensor:
+        if not use_deep_g:
+            self._context = (language_indexes, raw_g, False)
+            self.last_entry_ratio = 0.0
+            self.last_deep_ratios = [0.0] * len(SAMPLER_LAYERS)
+            self._capture_pair_scores = False
+            self.last_deep_queries = [None] * len(SAMPLER_LAYERS)
+            self.last_deep_pair_scores = [None] * len(SAMPLER_LAYERS)
+            return u
+        projected_g = self.projector(raw_g)
+        positioned_g = projected_g + position_embedding.to(
+            device=projected_g.device, dtype=projected_g.dtype,
+        )
+        self._context = (language_indexes, positioned_g, use_deep_g)
+        self._capture_pair_scores = bool(capture_pair_scores)
+        self.last_entry_ratio = 0.0
+        self.last_deep_ratios = [0.0] * len(SAMPLER_LAYERS)
+        self.last_deep_queries = [None] * len(SAMPLER_LAYERS)
+        self.last_deep_pair_scores = [None] * len(SAMPLER_LAYERS)
+        return u
+
+    def clear_context(self) -> None:
+        self._context = None
+        self._capture_pair_scores = False
+        self.last_deep_queries = [None] * len(SAMPLER_LAYERS)
+        self.last_deep_pair_scores = [None] * len(SAMPLER_LAYERS)
+
+    def apply_deep_sampler(self, sampler_index: int, packed_sequence: torch.Tensor) -> torch.Tensor:
+        if self._context is None:
+            raise RuntimeError("deep sampler called without active bridge context")
+        language_indexes, projected_g, use_g = self._context
+        if not use_g:
+            return packed_sequence
+        updated = packed_sequence.clone()
+        delta_square_sum = packed_sequence.new_zeros((), dtype=torch.float32)
+        hidden_square_sum = packed_sequence.new_zeros((), dtype=torch.float32)
+        element_count = 0
+        pair_queries = []
+        pair_scores = []
+        for batch_index, indexes in enumerate(language_indexes):
+            hidden = packed_sequence[indexes].unsqueeze(0)
+            sampled, delta, q, k = self.deep_samplers[sampler_index](
+                hidden, projected_g[batch_index:batch_index + 1],
+            )
+            updated[indexes] = sampled.squeeze(0)
+            delta_square_sum = delta_square_sum + delta.float().square().sum()
+            hidden_square_sum = hidden_square_sum + hidden.float().square().sum()
+            element_count += hidden.numel()
+            if self._capture_pair_scores:
+                pair_queries.append(q)
+                pair_scores.append(smooth_bidirectional_pair_score(q, k, self.pair_temperature))
+        self.last_deep_ratios[sampler_index] = float(
+            (delta_square_sum / element_count).sqrt() /
+            (hidden_square_sum / element_count).sqrt().clamp_min(1e-12)
+        )
+        if self._capture_pair_scores:
+            self.last_deep_queries[sampler_index] = pair_queries
+            self.last_deep_pair_scores[sampler_index] = torch.cat(pair_scores)
+        return updated
+
+    def deep_pair_scores(self) -> tuple[torch.Tensor, torch.Tensor]:
+        if any(score is None for score in self.last_deep_pair_scores):
+            raise RuntimeError("deep pair scores are incomplete")
+        by_layer = torch.stack([
+            score for score in self.last_deep_pair_scores if score is not None
+        ])
+        return by_layer.mean(dim=0), by_layer
+
+    def shuffled_deep_pair_scores(
+        self, raw_g: torch.Tensor, position_embedding: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if any(queries is None for queries in self.last_deep_queries):
+            raise RuntimeError("deep pair queries are incomplete")
+        projected_g = self.projector(raw_g)
+        positioned_g = projected_g + position_embedding.to(
+            device=projected_g.device, dtype=projected_g.dtype,
+        )
+        layer_scores = []
+        for sampler, query_list in zip(self.deep_samplers, self.last_deep_queries, strict=True):
+            assert query_list is not None
+            g = sampler.g_norm(positioned_g)
+            k = sampler.k(g)
+            scores = [
+                smooth_bidirectional_pair_score(
+                    query, k[index:index + 1], self.pair_temperature,
+                )
+                for index, query in enumerate(query_list)
+            ]
+            layer_scores.append(torch.cat(scores))
+        by_layer = torch.stack(layer_scores)
+        return by_layer.mean(dim=0), by_layer
+
+
+class UnderstandingLoRALinear(nn.Module):
+    def __init__(
+        self, base: nn.Linear, rank: int, alpha: float, master_dtype: torch.dtype,
+    ) -> None:
+        super().__init__()
+        if rank <= 0:
+            raise ValueError("LoRA rank must be positive")
+        self.base = base
+        self.base.requires_grad_(False)
+        self.scale = float(alpha) / rank
+        self.lora_A = nn.Parameter(torch.empty(
+            (rank, base.in_features), device=base.weight.device, dtype=master_dtype,
+        ))
+        self.lora_B = nn.Parameter(torch.zeros(
+            (base.out_features, rank), device=base.weight.device, dtype=master_dtype,
+        ))
+        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+
+    def forward(self, values: torch.Tensor) -> torch.Tensor:
+        lora_a = self.lora_A.to(dtype=values.dtype)
+        lora_b = self.lora_B.to(dtype=values.dtype)
+        return self.base(values) + F.linear(F.linear(values, lora_a), lora_b) * self.scale
+
+
+UNDERSTANDING_LORA_PATHS = (
+    "self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj",
+    "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj",
+)
+
+
+def install_understanding_lora(
+    bagel: nn.Module, rank: int, alpha: float, master_dtype: torch.dtype,
+) -> tuple[str, ...]:
+    installed = []
+    for layer_index, layer in enumerate(bagel._get_base_language_model().model.layers):
+        for path in UNDERSTANDING_LORA_PATHS:
+            parent = layer
+            parts = path.split(".")
+            for part in parts[:-1]:
+                parent = getattr(parent, part)
+            name = parts[-1]
+            linear = getattr(parent, name)
+            if not isinstance(linear, nn.Linear):
+                raise TypeError(f"LoRA target is not linear: layer={layer_index} path={path}")
+            setattr(parent, name, UnderstandingLoRALinear(linear, rank, alpha, master_dtype))
+            installed.append(f"model.layers.{layer_index}.{path}")
+    return tuple(installed)
+
+
+def understanding_lora_named_parameters(bagel: nn.Module) -> list[tuple[str, nn.Parameter]]:
+    result = []
+    for module_name, module in bagel._get_base_language_model().named_modules():
+        if isinstance(module, UnderstandingLoRALinear):
+            result.extend(((f"{module_name}.lora_A", module.lora_A), (f"{module_name}.lora_B", module.lora_B)))
+    return result
+
+
+def understanding_lora_state_dict(bagel: nn.Module) -> dict[str, torch.Tensor]:
+    return {name: value.detach().cpu().contiguous() for name, value in understanding_lora_named_parameters(bagel)}
+
+
+def load_understanding_lora_state(bagel: nn.Module, state: dict[str, torch.Tensor]) -> None:
+    expected = dict(understanding_lora_named_parameters(bagel))
+    if set(state) != set(expected):
+        raise RuntimeError(f"LoRA state mismatch: missing={len(set(expected)-set(state))} unexpected={len(set(state)-set(expected))}")
+    with torch.no_grad():
+        for name, parameter in expected.items():
+            parameter.copy_(state[name].to(device=parameter.device, dtype=parameter.dtype))
+
+
+def bridge_parameter_groups(bridge: Stage3Bridge, args: argparse.Namespace) -> list[dict[str, Any]]:
+    return [
+        {"params": list(bridge.projector.parameters()), "lr": args.projector_lr, "name": "projector"},
+        {"params": list(bridge.deep_samplers.parameters()), "lr": args.sampler_lr, "name": "deep_samplers"},
+    ]
+
+
+class Stage3CaptionModel(nn.Module):
+    def __init__(
+        self, bagel: nn.Module, tokenizer: Any, position_embedding: torch.Tensor,
+        max_prompt_tokens: int = 512,
+        mask_u_prob: float = 0.0,
+        mask_u_granularity: str = "per_sample_per_vit_token",
+        pair_temperature: float = 0.07,
+    ) -> None:
+        super().__init__()
+        self.bagel = bagel
+        self.bridge = Stage3Bridge(pair_temperature)
+        self.tokenizer = tokenizer
+        if max_prompt_tokens < 4:
+            raise ValueError("max_prompt_tokens must be at least 4")
+        if not 0.0 <= mask_u_prob <= 1.0:
+            raise ValueError(f"mask_u_prob must be in [0, 1], got {mask_u_prob}")
+        self.max_prompt_tokens = max_prompt_tokens
+        self.mask_u_prob = float(mask_u_prob)
+        if mask_u_granularity not in {"per_sample_per_vit_token", "per_sample_whole_u"}:
+            raise ValueError(f"unknown mask_u_granularity: {mask_u_granularity}")
+        self.mask_u_granularity = mask_u_granularity
+        self.last_u_mask_ratio = 0.0
+        self.last_prompt_truncations = 0
+        self.register_buffer("position_embedding", position_embedding, persistent=False)
+        base = bagel._get_base_language_model()
+        if len(base.model.layers) <= SAMPLER_LAYERS[-1]:
+            raise RuntimeError(f"BAGEL has only {len(base.model.layers)} layers")
+        self._hook_handles = []
+        for sampler_index, layer_index in enumerate(SAMPLER_LAYERS):
+            def hook(_module, _args, output, index=sampler_index):
+                return self.bridge.apply_deep_sampler(index, output)
+            self._hook_handles.append(base.model.layers[layer_index].register_forward_hook(hook))
+
+    def forward(
+        self,
+        raw_u: torch.Tensor,
+        raw_g: torch.Tensor,
+        prompts: list[str],
+        answers: list[str],
+        mode: str = "real",
+        ce_chunk_size: int | None = None,
+        capture_pair_scores: bool = False,
+        fixed_u_mask: torch.Tensor | None = None,
+        return_answer_logits: bool = False,
+        return_answer_hidden: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        batch = len(prompts)
+        if raw_u.shape[0] != batch or len(answers) != batch:
+            raise ValueError("tower/text batch mismatch")
+        bridge_dtype = self.bridge.projector.calibrator.weight.dtype
+        raw_u = raw_u.to(dtype=bridge_dtype)
+        raw_g = raw_g.to(dtype=bridge_dtype)
+        self.last_u_mask_ratio = 0.0
+        if fixed_u_mask is not None:
+            if fixed_u_mask.shape != raw_u.shape[:2] or fixed_u_mask.dtype != torch.bool:
+                raise ValueError(
+                    f"fixed U mask must be bool {tuple(raw_u.shape[:2])}, "
+                    f"got {fixed_u_mask.dtype} {tuple(fixed_u_mask.shape)}"
+                )
+            token_mask = fixed_u_mask.to(device=raw_u.device)
+            raw_u = raw_u.masked_fill(token_mask.unsqueeze(-1), 0.0)
+            self.last_u_mask_ratio = float(token_mask.float().mean().detach())
+        elif self.mask_u_prob > 0.0 and torch.is_grad_enabled():
+            if self.mask_u_granularity == "per_sample_per_vit_token":
+                token_mask = torch.rand(raw_u.shape[:2], device=raw_u.device) < self.mask_u_prob
+            else:
+                sample_mask = torch.rand(raw_u.shape[0], 1, device=raw_u.device) < self.mask_u_prob
+                token_mask = sample_mask.expand(raw_u.shape[0], raw_u.shape[1])
+            raw_u = raw_u.masked_fill(token_mask.unsqueeze(-1), 0.0)
+            self.last_u_mask_ratio = float(token_mask.float().mean().detach())
+        start_id = token_id(self.bagel.new_token_ids, "start_of_image")
+        end_id = token_id(self.bagel.new_token_ids, "end_of_image")
+        bos_id = token_id(self.bagel.new_token_ids, "bos_token_id")
+        eos_id = token_id(self.bagel.new_token_ids, "eos_token_id")
+        text_ids, text_indexes, labels, ce_indexes = [], [], [], []
+        image_indexes, language_indexes, position_ids, masks, sample_lens = [], [], [], [], []
+        cursor = 0
+        prompt_truncations = 0
+        for prompt, answer in zip(prompts, answers, strict=True):
+            prompt_ids = self.tokenizer.encode(prompt, return_tensors="pt")[0].to(raw_u.device)
+            prompt_budget = self.max_prompt_tokens - 2
+            if prompt_ids.numel() > prompt_budget:
+                head = prompt_budget // 2
+                prompt_ids = torch.cat([prompt_ids[:head], prompt_ids[-(prompt_budget - head):]])
+                prompt_truncations += 1
+            prompt_ids = torch.cat([prompt_ids.new_tensor([bos_id]), prompt_ids, prompt_ids.new_tensor([eos_id])])
+            target_ids = self.tokenizer.encode(answer, return_tensors="pt")[0].to(raw_u.device)
+            target_ids = torch.cat([target_ids, target_ids.new_tensor([eos_id])])
+            assistant = torch.cat([prompt_ids, prompt_ids.new_tensor([bos_id]), target_ids[:-1]])
+            image_len = TOKENS + 2
+            seq_len = image_len + int(assistant.numel())
+            assistant_index = cursor + image_len + int(prompt_ids.numel())
+            local_text_indexes = torch.cat([
+                torch.tensor([cursor, cursor + TOKENS + 1], dtype=torch.long, device=raw_u.device),
+                torch.arange(cursor + image_len, cursor + seq_len, dtype=torch.long, device=raw_u.device),
+            ])
+            text_ids.append(torch.cat([prompt_ids.new_tensor([start_id, end_id]), assistant]))
+            text_indexes.append(local_text_indexes)
+            labels.append(target_ids)
+            ce = torch.zeros(seq_len, dtype=torch.bool, device=raw_u.device)
+            ce[assistant_index - cursor: assistant_index - cursor + target_ids.numel()] = True
+            ce_indexes.append(ce)
+            image_indexes.append(torch.arange(cursor + 1, cursor + 1 + TOKENS, device=raw_u.device))
+            language_indexes.append(torch.arange(
+                cursor + image_len, cursor + seq_len,
+                dtype=torch.long, device=raw_u.device,
+            ))
+            position_ids.append(torch.cat([
+                torch.zeros(image_len, dtype=torch.long, device=raw_u.device),
+                torch.arange(1, 1 + assistant.numel(), dtype=torch.long, device=raw_u.device),
+            ]))
+            allowed = torch.tril(torch.ones(seq_len, seq_len, dtype=BF16, device=raw_u.device))
+            allowed[:image_len, :image_len] = 1
+            masks.append((1.0 - allowed) * torch.finfo(BF16).min)
+            sample_lens.append(seq_len)
+            cursor += seq_len
+        self.last_prompt_truncations = prompt_truncations
+
+        packed_text_ids = torch.cat(text_ids)
+        packed_text_indexes = torch.cat(text_indexes)
+        packed_image_indexes = torch.cat(image_indexes)
+        packed_text_embedding = self.bagel._embed_tokens(packed_text_ids)
+        packed_sequence = packed_text_embedding.new_zeros((cursor, WIDTH))
+        packed_sequence[packed_text_indexes] = packed_text_embedding
+        if mode not in {"real", "entry_only", "deep_only", "drop_g"}:
+            raise ValueError(f"unknown injection mode: {mode}")
+        fused_u = self.bridge.begin(
+            raw_u,
+            raw_g,
+            language_indexes,
+            use_entry_g=mode in {"real", "entry_only"},
+            use_deep_g=mode in {"real", "deep_only"},
+            position_embedding=self.position_embedding,
+            capture_pair_scores=capture_pair_scores,
+        )
+        visual_tokens = fused_u + self.position_embedding.to(
+            device=fused_u.device, dtype=fused_u.dtype,
+        )
+        packed_sequence[packed_image_indexes] = visual_tokens.to(
+            dtype=packed_sequence.dtype
+        ).reshape(-1, WIDTH)
+        packed_und_indexes = torch.cat([packed_text_indexes, packed_image_indexes])
+        empty = packed_image_indexes.new_empty((0,))
+        hidden = self.bagel._lm_forward_train(
+            packed_sequence=packed_sequence,
+            sample_lens=sample_lens,
+            attention_mask=masks,
+            packed_position_ids=torch.cat(position_ids),
+            packed_und_token_indexes=packed_und_indexes,
+            packed_gen_token_indexes=empty,
+        )
+        selected_hidden = hidden[torch.cat(ce_indexes)]
+        flat_labels = torch.cat(labels)
+        lm_head = self.bagel._get_base_language_model().lm_head
+        answer_logits = None
+        if return_answer_logits and return_answer_hidden:
+            raise ValueError("answer logits and hidden cannot both be requested")
+        if return_answer_logits:
+            if ce_chunk_size is not None:
+                raise ValueError("answer logits are incompatible with chunked CE")
+            answer_logits = lm_head(selected_hidden)
+            token_ce = F.cross_entropy(answer_logits, flat_labels, reduction="none")
+        else:
+            token_ce = token_cross_entropy(lm_head, selected_hidden, flat_labels, ce_chunk_size)
+        lengths = [int(target.numel()) for target in labels]
+        if token_ce.numel() != sum(lengths):
+            raise RuntimeError(f"CE length mismatch: {token_ce.numel()} != {sum(lengths)}")
+        ce_sums = torch.stack([chunk.sum() for chunk in token_ce.split(lengths)])
+        answer_lengths = torch.tensor(lengths, device=ce_sums.device, dtype=torch.float32)
+        if answer_logits is not None:
+            return ce_sums, answer_lengths, answer_logits
+        if return_answer_hidden:
+            return ce_sums, answer_lengths, selected_hidden
+        return ce_sums, answer_lengths
+
+
+def atomic_checkpoint(
+    output: Path,
+    step: int,
+    model: Stage3CaptionModel | DistributedDataParallel,
+    optimizer: torch.optim.Optimizer,
+    scheduler: Any,
+    validation: dict[str, Any],
+    rng_states: list[dict[str, Any]],
+    stage: str,
+    mask_u_schedule: tuple[tuple[float, ...], tuple[int, ...]] | None,
+    flexae: nn.Module | None = None,
+) -> None:
+    final = output / f"checkpoint-{step}"
+    if (final / "complete.json").is_file():
+        return
+    temporary = output / f".checkpoint-{step}.tmp"
+    if temporary.exists():
+        shutil.rmtree(temporary)
+    temporary.mkdir(parents=True)
+    module = model.module if isinstance(model, DistributedDataParallel) else model
+    save_file(
+        {name: value.detach().cpu().contiguous() for name, value in module.bridge.state_dict().items()},
+        str(temporary / "bridge.safetensors"),
+    )
+    if stage in {"stage2", "stage3"}:
+        save_file(understanding_lora_state_dict(module.bagel), str(temporary / "understanding_lora.safetensors"))
+    if flexae is not None:
+        save_file(
+            {name: value.detach().cpu().contiguous() for name, value in flexae.state_dict().items()},
+            str(temporary / "flexae.safetensors"),
+        )
+    torch.save(
+        {"step": step, "optimizer": optimizer.state_dict(), "scheduler": scheduler.state_dict()},
+        temporary / "optimizer.pt",
+    )
+    for rng_rank, rng_state in enumerate(rng_states):
+        torch.save(rng_state, temporary / f"rng_rank{rng_rank}.pt")
+    (temporary / "complete.json").write_text(json.dumps({
+        "schema": CHECKPOINT_SCHEMA,
+        "architecture_id": ARCHITECTURE_ID,
+        "stage": stage,
+        "step": step,
+        "trainable_parameters": sum(p.numel() for p in module.bridge.parameters()),
+        "projector_parameters": sum(p.numel() for p in module.bridge.projector.parameters()),
+        "entry_fuser_parameters": 0,
+        "deep_sampler_parameters": sum(p.numel() for p in module.bridge.deep_samplers.parameters()),
+        "sampler_layers": list(SAMPLER_LAYERS),
+        "model_width": WIDTH,
+        "work_width": WORK_WIDTH,
+        "attention_heads": 16,
+        "g_tokens": TOKENS,
+        "attention_scope": "global_256",
+        "deep_query_source": "contextual_llm_language_hidden",
+        "entry_fuser": False,
+        "entry_query_source": None,
+        "deep_post_attention_input": "attention_only",
+        "projected_g_position_embedding": "fixed_bagel_vit_2d",
+        "projector_init": "identity_from_stage1_raw_g",
+        "lora": stage in {"stage2", "stage3"},
+        "flexae_trainable_after_step": 2501,
+        "flexae_parameters": 0 if flexae is None else sum(p.numel() for p in flexae.parameters()),
+        "understanding_lora_parameters": sum(p.numel() for _, p in understanding_lora_named_parameters(module.bagel)),
+        "understanding_lora_tensors": len(understanding_lora_named_parameters(module.bagel)),
+        "rng_ranks": len(rng_states),
+        "position_embedding_additions": 2,
+        "mask_u_probability": module.mask_u_prob,
+        "mask_u_schedule": (
+            {
+                "probabilities": list(mask_u_schedule[0]),
+                "boundaries": list(mask_u_schedule[1]),
+                "step_contract": "inclusive_upper_bound_global_optimizer_step",
+            }
+            if mask_u_schedule is not None else None
+        ),
+        "validation": validation,
+    }, indent=2, sort_keys=True) + "\n")
+    os.replace(temporary, final)
+
+
+def complete_checkpoint(path: Path, stage: str, world_size: int) -> tuple[int, dict[str, Any]] | None:
+    required = ["bridge.safetensors", "optimizer.pt", "complete.json"]
+    if stage in {"stage2", "stage3"}:
+        required.append("understanding_lora.safetensors")
+    if stage == "stage2":
+        required.append("flexae.safetensors")
+    required.extend(f"rng_rank{rank}.pt" for rank in range(world_size))
+    if any(not (path / name).is_file() for name in required):
+        return None
+    try:
+        step = int(path.name.rsplit("-", 1)[-1])
+        marker = json.loads((path / "complete.json").read_text(encoding="utf-8"))
+        if (
+            marker.get("schema") != CHECKPOINT_SCHEMA
+            or marker.get("architecture_id") != ARCHITECTURE_ID
+            or marker.get("step") != step
+            or marker.get("stage") != stage
+            or marker.get("rng_ranks") != world_size
+        ):
+            return None
+        return step, marker
+    except (ValueError, OSError, json.JSONDecodeError):
+        return None
+
+
+def retain_checkpoints(output: Path, stage: str, world_size: int, keep_latest: int) -> dict[str, Any]:
+    complete = []
+    for path in output.glob("checkpoint-*"):
+        result = complete_checkpoint(path, stage, world_size)
+        if result is not None:
+            complete.append((result[0], path, result[1]))
+    complete.sort()
+    latest = {step for step, _, _ in complete[-keep_latest:]}
+    scored = [
+        (float(marker["validation"]["real_shuffle_gap"]), step)
+        for step, _, marker in complete
+        if isinstance(marker.get("validation"), dict) and "real_shuffle_gap" in marker["validation"]
+    ]
+    best_step = max(scored)[1] if scored else None
+    keep = latest | ({best_step} if best_step is not None else set())
+    removed = []
+    for step, path, _ in complete:
+        if step not in keep:
+            shutil.rmtree(path)
+            removed.append(step)
+    decision = {"stage": stage, "best_gap_step": best_step, "latest_steps": sorted(latest), "kept_steps": sorted(keep), "removed_steps": removed}
+    temporary = output / ".retention.json.tmp"
+    temporary.write_text(json.dumps(decision, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(temporary, output / "retention.json")
+    return decision
+
+
+def length_bin(length: int) -> str:
+    for upper in (4, 16, 64, 128, 256, 512):
+        if length <= upper:
+            return f"le_{upper}"
+    return "gt_512"
+
+
+def summarize_gap_records(records: list[dict[str, Any]]) -> dict[str, Any]:
+    if not records:
+        raise RuntimeError("distributed validation produced no records")
+
+    def summarize(rows: list[dict[str, Any]]) -> dict[str, float | int]:
+        return {
+            "count": len(rows),
+            "gap_token_mean": sum(row["gap_token_mean"] for row in rows) / len(rows),
+            "gap_ce_sum": sum(row["gap_ce_sum"] for row in rows) / len(rows),
+            "gap_sqrt_length": sum(row["gap_sqrt_length"] for row in rows) / len(rows),
+            "positive_gap_fraction": sum(row["gap_token_mean"] > 0 for row in rows) / len(rows),
+        }
+
+    bins: dict[str, dict[str, dict[str, float | int]]] = {}
+    keys = {
+        "answer_length": lambda row: length_bin(int(row["answer_tokens"])),
+        "visual_dependency": lambda row: str(row["visual_dependency"]),
+        "image_correspondence": lambda row: str(row["image_correspondence"]),
+        "relevance": lambda row: str(row["relevance"]),
+    }
+    for family, key_fn in keys.items():
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for row in records:
+            grouped.setdefault(key_fn(row), []).append(row)
+        bins[family] = {key: summarize(rows) for key, rows in sorted(grouped.items())}
+    return {"per_sample_summary": summarize(records), "bins": bins}
+
+
+def validate_distributed(
+    model: Stage3CaptionModel,
+    manifest: FineVisionManifest,
+    sample_count: int,
+    extract_towers: Any,
+    batch_size: int,
+    rank: int,
+    world_size: int,
+) -> tuple[dict[str, Any] | None, list[dict[str, Any]] | None]:
+    if batch_size not in {1, 2} or sample_count % (world_size * batch_size):
+        raise RuntimeError(
+            "validation requires complete global batches with batch_size_per_rank in {1,2}"
+        )
+    plan_container: list[dict[str, Any] | None] = [None]
+    if rank == 0:
+        packed_lengths = []
+        for index in range(sample_count):
+            row = manifest.get(index)
+            prompt_tokens = min(
+                len(model.tokenizer.encode(row["prompt"])),
+                model.max_prompt_tokens - 2,
+            ) + 2
+            answer_tokens = len(model.tokenizer.encode(row["answer"])) + 1
+            packed_lengths.append(TOKENS + 2 + prompt_tokens + answer_tokens)
+        sorted_indices = sorted(range(sample_count), key=lambda index: (packed_lengths[index], index))
+        pairs = [
+            (sorted_indices[offset], sorted_indices[-1 - offset])
+            for offset in range(sample_count // 2)
+        ]
+        rank_indices = [[] for _ in range(world_size)]
+        for pair_index, pair in enumerate(pairs):
+            rank_indices[pair_index % world_size].extend(pair)
+        plan_container[0] = {
+            "rank_indices": rank_indices,
+            "max_sample_packed_tokens": max(packed_lengths),
+            "max_pair_packed_tokens": max(
+                packed_lengths[first] + packed_lengths[second]
+                for first, second in pairs
+            ),
+        }
+    dist.broadcast_object_list(plan_container, src=0)
+    plan = plan_container[0]
+    assert plan is not None
+    local_indices = plan["rank_indices"][rank]
+    local_records: list[dict[str, Any]] = []
+    real_entry_ratio_batches: list[float] = []
+    real_deep_ratio_batches: list[list[float]] = []
+    with torch.no_grad():
+        for start in range(0, len(local_indices), batch_size):
+            indexes = local_indices[start:start + batch_size]
+            rows = [manifest.get(index) for index in indexes]
+            donor_indexes = [(index + 1) % sample_count for index in indexes]
+            donor_rows = [manifest.get(index) for index in donor_indexes]
+            raw_u, raw_g = extract_towers([image_source(row) for row in rows])
+            _, donor_g = extract_towers([image_source(row) for row in donor_rows])
+            prompts = [row["prompt"] for row in rows]
+            answers = [row["answer"] for row in rows]
+            masked_u = torch.ones(
+                raw_u.shape[:2], dtype=torch.bool, device=raw_u.device,
+            )
+            outputs: dict[str, tuple[torch.Tensor, ...]] = {}
+            for name, condition_g, condition_mask in (
+                ("clean_real", raw_g, None),
+                ("clean_shuffle", donor_g, None),
+                ("clean_zero", torch.zeros_like(raw_g), None),
+                ("masked_real", raw_g, masked_u),
+                ("masked_shuffle", donor_g, masked_u),
+                ("masked_zero", torch.zeros_like(raw_g), masked_u),
+            ):
+                with torch.autocast("cuda", dtype=BF16):
+                    outputs[name] = model(
+                        raw_u, condition_g, prompts, answers, "real",
+                        ce_chunk_size=32,
+                        fixed_u_mask=condition_mask,
+                    )
+                if name == "clean_real":
+                    real_entry_ratio_batches.append(model.bridge.last_entry_ratio)
+                    real_deep_ratio_batches.append(list(model.bridge.last_deep_ratios))
+                model.bridge.clear_context()
+            drop_kl: dict[str, list[float]] = {}
+            for suffix, condition_mask in (("clean", None), ("masked", masked_u)):
+                reference_name = f"reference_{suffix}_shuffle"
+                drop_name = f"{suffix}_drop"
+                with disable_understanding_lora(model.bagel):
+                    with torch.autocast("cuda", dtype=BF16):
+                        reference_output = model(
+                            raw_u, donor_g, prompts, answers, "drop_g",
+                            fixed_u_mask=condition_mask,
+                            ce_chunk_size=32,
+                            return_answer_hidden=True,
+                        )
+                    model.bridge.clear_context()
+                with torch.autocast("cuda", dtype=BF16):
+                    drop_output = model(
+                        raw_u, raw_g, prompts, answers, "drop_g",
+                        fixed_u_mask=condition_mask,
+                        ce_chunk_size=32,
+                        return_answer_hidden=True,
+                    )
+                model.bridge.clear_context()
+                if not torch.equal(drop_output[1], reference_output[1]):
+                    raise RuntimeError(f"{suffix} drop/reference answer lengths changed")
+                int_lengths = [int(value) for value in drop_output[1].detach().cpu().tolist()]
+                lm_head = model.bagel._get_base_language_model().lm_head
+                drop_kl[drop_name] = [
+                    float(chunk.mean().detach())
+                    for chunk in forward_kl_from_hidden(
+                        lm_head,
+                        drop_output[2], reference_output[2],
+                    ).split(int_lengths)
+                ]
+                outputs[drop_name] = (drop_output[0], drop_output[1])
+                outputs[reference_name] = (reference_output[0], reference_output[1])
+                del drop_output, reference_output
+            outputs["reference_clean_real"] = outputs["reference_clean_shuffle"]
+            outputs["reference_masked_real"] = outputs["reference_masked_shuffle"]
+            lengths = outputs["clean_real"][1].detach().cpu().tolist()
+            sums = {
+                name: value[0].detach().float().cpu().tolist()
+                for name, value in outputs.items()
+            }
+            for offset, (index, donor_index, row, answer_tokens) in enumerate(
+                zip(indexes, donor_indexes, rows, lengths, strict=True)
+            ):
+                length = int(answer_tokens)
+                clean_real_sum = float(sums["clean_real"][offset])
+                clean_shuffle_sum = float(sums["clean_shuffle"][offset])
+                clean_zero_sum = float(sums["clean_zero"][offset])
+                masked_real_sum = float(sums["masked_real"][offset])
+                masked_shuffle_sum = float(sums["masked_shuffle"][offset])
+                masked_zero_sum = float(sums["masked_zero"][offset])
+                clean_drop_sum = float(sums["clean_drop"][offset])
+                masked_drop_sum = float(sums["masked_drop"][offset])
+                reference_clean_real_sum = float(sums["reference_clean_real"][offset])
+                reference_clean_shuffle_sum = float(sums["reference_clean_shuffle"][offset])
+                reference_masked_real_sum = float(sums["reference_masked_real"][offset])
+                reference_masked_shuffle_sum = float(sums["reference_masked_shuffle"][offset])
+                local_records.append({
+                    "index": index,
+                    "id": row["id"],
+                    "donor_index": donor_index,
+                    "answer_tokens": length,
+                    "visual_dependency": row["visual_dependency"],
+                    "image_correspondence": row["image_correspondence"],
+                    "relevance": row["relevance"],
+                    "real_ce": clean_real_sum / length,
+                    "shuffle_ce": clean_shuffle_sum / length,
+                    "zero_ce": clean_zero_sum / length,
+                    "drop_ce": clean_drop_sum / length,
+                    "drop_reference_kl": drop_kl["clean_drop"][offset],
+                    "gap_token_mean": (clean_shuffle_sum - clean_real_sum) / length,
+                    "support_token_mean": (clean_zero_sum - clean_real_sum) / length,
+                    "rejection_token_mean": (clean_shuffle_sum - clean_zero_sum) / length,
+                    "gap_ce_sum": clean_shuffle_sum - clean_real_sum,
+                    "gap_sqrt_length": (clean_shuffle_sum - clean_real_sum) / math.sqrt(length),
+                    "masked_real_ce": masked_real_sum / length,
+                    "masked_shuffle_ce": masked_shuffle_sum / length,
+                    "masked_zero_ce": masked_zero_sum / length,
+                    "masked_drop_ce": masked_drop_sum / length,
+                    "masked_drop_reference_kl": drop_kl["masked_drop"][offset],
+                    "reference_real_ce": reference_clean_real_sum / length,
+                    "reference_shuffle_ce": reference_clean_shuffle_sum / length,
+                    "shuffle_ce_drift": (
+                        clean_shuffle_sum - reference_clean_shuffle_sum
+                    ) / length,
+                    "reference_masked_real_ce": reference_masked_real_sum / length,
+                    "reference_masked_shuffle_ce": reference_masked_shuffle_sum / length,
+                    "masked_shuffle_ce_drift": (
+                        masked_shuffle_sum - reference_masked_shuffle_sum
+                    ) / length,
+                    "masked_gap_token_mean": (
+                        masked_shuffle_sum - masked_real_sum
+                    ) / length,
+                    "masked_support_token_mean": (
+                        masked_zero_sum - masked_real_sum
+                    ) / length,
+                    "masked_rejection_token_mean": (
+                        masked_shuffle_sum - masked_zero_sum
+                    ) / length,
+                })
+    gathered: list[list[dict[str, Any]] | None] | None = [None] * world_size if rank == 0 else None
+    dist.gather_object(local_records, gathered, dst=0)
+    gathered_ratios: list[list[list[float]] | None] | None = [None] * world_size if rank == 0 else None
+    dist.gather_object(real_deep_ratio_batches, gathered_ratios, dst=0)
+    gathered_entry_ratios: list[list[float] | None] | None = [None] * world_size if rank == 0 else None
+    dist.gather_object(real_entry_ratio_batches, gathered_entry_ratios, dst=0)
+    if rank != 0:
+        return None, None
+    assert gathered is not None and gathered_ratios is not None and gathered_entry_ratios is not None
+    records = sorted(
+        [record for rank_records in gathered if rank_records for record in rank_records],
+        key=lambda row: row["index"],
+    )
+    if len(records) != sample_count:
+        raise RuntimeError(f"validation count mismatch: {len(records)} != {sample_count}")
+    ratio_batches = [
+        ratios
+        for rank_batches in gathered_ratios
+        if rank_batches is not None
+        for ratios in rank_batches
+    ]
+    result: dict[str, Any] = {
+        "sample_count": sample_count,
+        "world_size": world_size,
+        "batch_size_per_rank": batch_size,
+        "global_batch_size": world_size * batch_size,
+        "shuffle_contract": "fixed_next_sample_donor_g",
+        "validation_order_contract": "packed_length_long_short_pairs_rank_balanced",
+        "validation_ce_chunk_size": 32,
+        "validation_drop_contract": "true_drop_g_with_current_lora_no_bridge",
+        "validation_drop_kl_reference": "bridge_bypassed_and_lora_scale_zero_base_teacher",
+        "validation_u_contract": "dual_clean_u_and_whole_sample_zero_u",
+        "max_sample_packed_tokens": plan["max_sample_packed_tokens"],
+        "max_pair_packed_tokens": plan["max_pair_packed_tokens"],
+        "real_ce": sum(row["real_ce"] for row in records) / sample_count,
+        "shuffle_ce": sum(row["shuffle_ce"] for row in records) / sample_count,
+        "zero_ce": sum(row["zero_ce"] for row in records) / sample_count,
+        "drop_ce": sum(row["drop_ce"] for row in records) / sample_count,
+        "drop_reference_kl": sum(row["drop_reference_kl"] for row in records) / sample_count,
+        "masked_real_ce": sum(row["masked_real_ce"] for row in records) / sample_count,
+        "masked_shuffle_ce": sum(row["masked_shuffle_ce"] for row in records) / sample_count,
+        "masked_zero_ce": sum(row["masked_zero_ce"] for row in records) / sample_count,
+        "masked_drop_ce": sum(row["masked_drop_ce"] for row in records) / sample_count,
+        "masked_drop_reference_kl": sum(row["masked_drop_reference_kl"] for row in records) / sample_count,
+        "reference_real_ce": sum(row["reference_real_ce"] for row in records) / sample_count,
+        "reference_shuffle_ce": sum(row["reference_shuffle_ce"] for row in records) / sample_count,
+        "shuffle_ce_drift": sum(row["shuffle_ce_drift"] for row in records) / sample_count,
+        "reference_masked_real_ce": sum(row["reference_masked_real_ce"] for row in records) / sample_count,
+        "reference_masked_shuffle_ce": sum(row["reference_masked_shuffle_ce"] for row in records) / sample_count,
+        "masked_shuffle_ce_drift": sum(row["masked_shuffle_ce_drift"] for row in records) / sample_count,
+        "real_entry_residual_rms_ratio_batch_mean": sum(
+            ratio for rank_ratios in gathered_entry_ratios if rank_ratios for ratio in rank_ratios
+        ) / sum(len(rank_ratios) for rank_ratios in gathered_entry_ratios if rank_ratios),
+        "real_deep_residual_rms_ratios_batch_mean": [
+            sum(ratios[layer] for ratios in ratio_batches) / len(ratio_batches)
+            for layer in range(len(SAMPLER_LAYERS))
+        ],
+    }
+    result["real_shuffle_gap"] = result["shuffle_ce"] - result["real_ce"]
+    result["reference_real_shuffle_gap"] = (
+        result["reference_shuffle_ce"] - result["reference_real_ce"]
+    )
+    result["dpo_gap_improvement"] = (
+        result["real_shuffle_gap"] - result["reference_real_shuffle_gap"]
+    )
+    result["real_zero_support"] = result["zero_ce"] - result["real_ce"]
+    result["zero_shuffle_rejection"] = result["shuffle_ce"] - result["zero_ce"]
+    result["masked_real_shuffle_gap"] = (
+        result["masked_shuffle_ce"] - result["masked_real_ce"]
+    )
+    result["reference_masked_real_shuffle_gap"] = (
+        result["reference_masked_shuffle_ce"] - result["reference_masked_real_ce"]
+    )
+    result["masked_dpo_gap_improvement"] = (
+        result["masked_real_shuffle_gap"]
+        - result["reference_masked_real_shuffle_gap"]
+    )
+    result["masked_real_zero_support"] = (
+        result["masked_zero_ce"] - result["masked_real_ce"]
+    )
+    result["masked_zero_shuffle_rejection"] = (
+        result["masked_shuffle_ce"] - result["masked_zero_ce"]
+    )
+    result.update(summarize_gap_records(records))
+    return result, records
+
+
+def move_optimizer_state(
+    optimizer: torch.optim.Optimizer,
+    device: torch.device | str,
+) -> None:
+    for state in optimizer.state.values():
+        for name, value in state.items():
+            if torch.is_tensor(value):
+                state[name] = value.to(device=device)
+
+
+def parameter_update_audit(
+    bridge: Stage3Bridge,
+    initial_state: dict[str, torch.Tensor],
+    optimizer: torch.optim.Optimizer,
+) -> dict[str, Any]:
+    components: dict[str, dict[str, Any]] = {}
+    zero_update_tensors: list[str] = []
+    for name, parameter in bridge.named_parameters():
+        current = parameter.detach().cpu()
+        initial = initial_state[name]
+        if current.shape != initial.shape or current.dtype != initial.dtype:
+            raise RuntimeError(f"initial-state mismatch for {name}")
+        changed = current.ne(initial)
+        delta = current.float() - initial.float()
+        component = name.split(".", 1)[0]
+        stats = components.setdefault(component, {
+            "elements": 0, "changed_elements": 0, "delta_l2_sq": 0.0,
+            "delta_abs_sum": 0.0, "delta_abs_max": 0.0,
+        })
+        stats["elements"] += current.numel()
+        stats["changed_elements"] += int(changed.sum())
+        stats["delta_l2_sq"] += float(delta.square().sum())
+        stats["delta_abs_sum"] += float(delta.abs().sum())
+        stats["delta_abs_max"] = max(stats["delta_abs_max"], float(delta.abs().max()))
+        if not bool(changed.any()):
+            zero_update_tensors.append(name)
+    for stats in components.values():
+        elements = stats["elements"]
+        stats["changed_fraction"] = stats["changed_elements"] / elements
+        stats["delta_rms"] = math.sqrt(stats.pop("delta_l2_sq") / elements)
+        stats["delta_abs_mean"] = stats.pop("delta_abs_sum") / elements
+
+    moment_dtypes: dict[str, int] = {}
+    for state in optimizer.state.values():
+        for key in ("exp_avg", "exp_avg_sq"):
+            value = state.get(key)
+            if torch.is_tensor(value):
+                dtype = str(value.dtype).replace("torch.", "")
+                moment_dtypes[dtype] = moment_dtypes.get(dtype, 0) + 1
+    parameter_dtypes: dict[str, int] = {}
+    for parameter in bridge.parameters():
+        dtype = str(parameter.dtype).replace("torch.", "")
+        parameter_dtypes[dtype] = parameter_dtypes.get(dtype, 0) + 1
+    return {
+        "components": components,
+        "zero_update_tensor_count": len(zero_update_tensors),
+        "zero_update_tensors": zero_update_tensors,
+        "parameter_tensor_dtypes": parameter_dtypes,
+        "adam_moment_tensor_dtypes": moment_dtypes,
+    }
+
+
+def enable_layer_activation_checkpointing(bagel: nn.Module) -> int:
+    layers = bagel._get_base_language_model().model.layers
+    enabled = 0
+    for layer in layers:
+        if getattr(layer, "_gtoken_activation_checkpointing", False):
+            continue
+        original_forward = layer.forward
+
+        def checkpointed_forward(*args, _forward=original_forward, **kwargs):
+            if torch.is_grad_enabled():
+                return torch_checkpoint(
+                    _forward, *args, use_reentrant=False, **kwargs,
+                )
+            return _forward(*args, **kwargs)
+
+        layer.forward = checkpointed_forward
+        layer._gtoken_activation_checkpointing = True
+        enabled += 1
+    return enabled
+
+
+def main() -> None:
+    args = parse_args()
+    mask_u_schedule_horizon = args.mask_u_schedule_horizon or args.max_steps
+    if args.max_steps > mask_u_schedule_horizon:
+        raise ValueError("max_steps cannot exceed mask-U schedule horizon")
+    mask_u_schedule = parse_mask_u_schedule(
+        args.mask_u_schedule,
+        args.mask_u_schedule_boundaries,
+        mask_u_schedule_horizon,
+    )
+    shuffle_kl_schedule = parse_shuffle_kl_schedule(
+        args.shuffle_kl_schedule_steps,
+        args.shuffle_kl_schedule_weights,
+        args.schedule_max_steps or args.max_steps,
+    )
+    if mask_u_schedule is not None and args.mask_u_prob != mask_u_schedule[0][0]:
+        raise ValueError(
+            "mask-u-prob must equal the first scheduled probability: "
+            f"{args.mask_u_prob} != {mask_u_schedule[0][0]}"
+        )
+    if args.g_pair_loss_weight < 0.0:
+        raise ValueError("g-pair-loss-weight must be non-negative")
+    if args.real_drop_loss_weight < 0.0 or args.real_shuffle_loss_weight < 0.0:
+        raise ValueError("DPO loss weights must be non-negative")
+    if args.real_drop_loss_weight != 0.0:
+        raise ValueError("group C must not train drop-DPO")
+    if args.dpo_real_weight < 0.0 or args.dpo_negative_weight < 0.0:
+        raise ValueError("DPO branch weights must be non-negative")
+    if args.dpo_negative_grad_cap < 0.0:
+        raise ValueError("dpo-negative-grad-cap must be non-negative")
+    if args.g_pair_temperature <= 0.0:
+        raise ValueError("g-pair-temperature must be positive")
+    if args.answer_use_loss_weight < 0.0:
+        raise ValueError("answer-use loss weight must be non-negative")
+    if args.real_ce_loss_weight < 0.0:
+        raise ValueError("real-ce-loss-weight must be non-negative")
+    if args.answer_use_beta <= 0.0:
+        raise ValueError("answer-use beta must be positive")
+    if args.shuffle_kl_weight < 0.0:
+        raise ValueError("shuffle-kl-weight must be non-negative")
+    if args.drop_kl_weight < 0.0:
+        raise ValueError("drop-kl-weight must be non-negative")
+    maximum_shuffle_kl_weight = max(
+        (args.shuffle_kl_weight,)
+        + (() if shuffle_kl_schedule is None else shuffle_kl_schedule[1])
+    )
+    if (maximum_shuffle_kl_weight > 0.0 or args.drop_kl_weight > 0.0) and args.answer_use_loss_weight <= 0.0:
+        raise ValueError("shuffle KL requires reference-relative answer-use DPO")
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    rank = int(os.environ.get("RANK", "0"))
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    device = torch.device("cuda", local_rank)
+    torch.cuda.set_device(device)
+    random.seed(args.seed + rank)
+    torch.manual_seed(args.seed + rank)
+    torch.cuda.manual_seed_all(args.seed + rank)
+    os.environ["BAGEL_ROOT"] = args.bagel_root
+    os.environ["BAGEL_MODEL_PATH"] = args.bagel_model
+    for path in (args.flexae_root, args.legacy_scripts, args.bagel_plugins, args.bagel_root):
+        if path not in sys.path:
+            sys.path.insert(0, path)
+
+    from data.data_utils import patchify
+    from data.transforms import ImageTransform
+    from flexae_model import BagelFlexAE256, patchify_latents
+    from gtoken_bagel.native_loader import load_bagel_native
+    from train_flexae import TrainConfig, encode_images, load_frozen_vae
+
+    if not dist.is_initialized():
+        if world_size > 1:
+            dist.init_process_group("nccl", device_id=device)
+        else:
+            fd, group_file = tempfile.mkstemp(prefix="stage3_bridge_")
+            os.close(fd)
+            os.unlink(group_file)
+            dist.init_process_group("nccl", init_method=f"file://{group_file}", rank=0, world_size=1, device_id=device)
+
+    output = Path(args.output_dir)
+    if rank == 0:
+        output.mkdir(parents=True, exist_ok=True)
+    dist.barrier()
+    manifest = load_manifest(args.manifest, args.image_root_from, args.image_root_to)
+    val_manifest = load_manifest(args.val_manifest, args.image_root_from, args.image_root_to)
+    if not isinstance(manifest, FineVisionManifest) or not isinstance(val_manifest, FineVisionManifest):
+        raise TypeError("TextVQA CoPO requires embedded-image Parquet manifests")
+    bagel, tokenizer = load_bagel_native(device, visual_gen=False, visual_und=True)
+    bagel.train()
+    bagel.requires_grad_(False)
+    activation_checkpoint_layers = 0
+    if args.activation_checkpoint:
+        base_lm = bagel._get_base_language_model()
+        base_lm.gradient_checkpointing = True
+        base_lm.config.use_cache = False
+        activation_checkpoint_layers = enable_layer_activation_checkpointing(bagel)
+    for module in bagel.modules():
+        if isinstance(module, nn.Dropout):
+            module.eval()
+
+    vae_config = TrainConfig(
+        train_manifest=args.manifest,
+        val_manifest=args.val_manifest,
+        output_dir=str(output),
+        bagel_root=args.bagel_root,
+        bagel_model_path=args.bagel_model,
+    )
+    vae = load_frozen_vae(vae_config, device)
+    vae.requires_grad_(False)
+    flexae = BagelFlexAE256(gradient_checkpointing=False).to(device=device, dtype=torch.float32).eval()
+    flexae.load_state_dict(load_file(args.flexae_checkpoint), strict=True)
+    flexae.requires_grad_(False)
+    encoder_parameters = [
+        parameter
+        for name in ("source_embed", "encoder", "g_projector")
+        for parameter in getattr(flexae, name).parameters()
+    ] + [flexae.encoder_query]
+    encoder_trainable = False
+    vit_transform = ImageTransform(224, 224, 14, max_pixels=224 * 224)
+    position_ids_2d = bagel.get_flattened_position_ids(
+        224, 224, bagel.vit_patch_size, max_num_patches_per_side=bagel.vit_max_num_patch_per_side
+    ).to(device)
+    if position_ids_2d.numel() != TOKENS:
+        raise RuntimeError(f"expected {TOKENS} BAGEL positions, got {position_ids_2d.numel()}")
+    position_embedding = bagel.vit_pos_embed(position_ids_2d).float().reshape(1, TOKENS, WIDTH).detach()
+
+    def preprocess_towers(sources: list[str | bytes | bytearray]) -> tuple[torch.Tensor, torch.Tensor]:
+        images = [load_pil(source) for source in sources]
+        vae_pixels = torch.stack([vae_tensor(image) for image in images])
+        vit_images = [vit_transform(image.resize((224, 224), Image.Resampling.BICUBIC)) for image in images]
+        for image in vit_images:
+            if tuple(image.shape[-2:]) != (224, 224):
+                raise RuntimeError(f"U preprocessing is not 224x224: {tuple(image.shape)}")
+        return vae_pixels, torch.cat([patchify(image, bagel.vit_patch_size) for image in vit_images])
+
+    def extract_preprocessed(inputs: tuple[torch.Tensor, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
+        vae_pixels, vit_tokens = inputs
+        batch_size = vae_pixels.shape[0]
+        vae_pixels = vae_pixels.to(device)
+        vit_tokens = vit_tokens.to(
+            device=device, dtype=bagel.vit_model.vision_model.embeddings.patch_embedding.weight.dtype,
+        )
+        vit_positions = position_ids_2d.repeat(batch_size)
+        seqlens = torch.full((batch_size,), TOKENS, dtype=torch.int32, device=device)
+        cu_seqlens = F.pad(torch.cumsum(seqlens, 0), (1, 0)).to(torch.int32)
+        with torch.inference_mode(), torch.autocast("cuda", dtype=BF16):
+            hidden = bagel.vit_model(
+                packed_pixel_values=vit_tokens,
+                packed_flattened_position_ids=vit_positions,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=TOKENS,
+            )
+            raw_u = bagel.connector(hidden).reshape(batch_size, TOKENS, WIDTH)
+            latent = encode_images(vae, vae_pixels, "mean")
+            raw_g, _ = flexae.encode(patchify_latents(latent))
+        if args.tower_handoff_dtype == "bf16":
+            return raw_u.to(dtype=BF16).clone(), raw_g.to(dtype=BF16).clone()
+        return raw_u.float().clone(), raw_g.float().clone()
+
+    def extract_towers(sources: list[str | bytes | bytearray]) -> tuple[torch.Tensor, torch.Tensor]:
+        return extract_preprocessed(preprocess_towers(sources))
+
+    class EncoderOnlyFlexAE(nn.Module):
+        def __init__(self, base: nn.Module) -> None:
+            super().__init__()
+            self.base = base
+
+        def forward(self, patches: torch.Tensor) -> torch.Tensor:
+            return self.base.encode(patches)[0]
+
+    encoder_forward = EncoderOnlyFlexAE(flexae)
+
+    model = Stage3CaptionModel(
+        bagel, tokenizer, position_embedding,
+        max_prompt_tokens=args.max_prompt_tokens,
+        mask_u_prob=args.mask_u_prob,
+        mask_u_granularity=args.mask_u_granularity,
+        pair_temperature=args.g_pair_temperature,
+    ).to(device=device, dtype=BF16)
+    model.bagel.requires_grad_(False)
+    model.bridge.requires_grad_(True)
+    if args.stage == "stage3":
+        if args.init_bridge_checkpoint:
+            bridge_artifact = Path(args.init_bridge_checkpoint) / "bridge.safetensors"
+            if not bridge_artifact.is_file():
+                raise FileNotFoundError(f"missing bridge initializer: {bridge_artifact}")
+            model.bridge.load_state_dict(load_file(bridge_artifact), strict=True)
+    bridge_master_dtype = BF16 if args.bridge_master_dtype == "bf16" else torch.float32
+    model.bridge.to(dtype=bridge_master_dtype)
+    lora_master_dtype = BF16 if args.lora_master_dtype == "bf16" else torch.float32
+    if args.stage in {"stage2", "stage3"}:
+        lora_targets = install_understanding_lora(
+            model.bagel, args.lora_rank, args.lora_alpha, lora_master_dtype,
+        )
+    else:
+        lora_targets = ()
+    lora_named = understanding_lora_named_parameters(model.bagel)
+    lora_parameters = [parameter for _, parameter in lora_named]
+    lora_ids = {id(parameter) for parameter in lora_parameters}
+    expected_targets = len(model.bagel._get_base_language_model().model.layers) * len(UNDERSTANDING_LORA_PATHS)
+    if args.stage in {"stage2", "stage3"} and (len(lora_targets) != expected_targets or len(lora_named) != expected_targets * 2):
+        raise RuntimeError(f"LoRA coverage mismatch: targets={len(lora_targets)} tensors={len(lora_named)}")
+
+    reference_path = output / "reference_trainables.safetensors"
+    if rank == 0 and not reference_path.is_file():
+        save_file(
+            {
+                name: parameter.detach().cpu().contiguous()
+                for name, parameter in trainable_named_parameters(model).items()
+            },
+            str(reference_path),
+        )
+    dist.barrier()
+    reference_state_cpu = load_file(str(reference_path))
+    current_named = trainable_named_parameters(model)
+    if set(reference_state_cpu) != set(current_named):
+        raise RuntimeError("frozen reference does not match current bridge/LoRA layout")
+    with torch.no_grad():
+        for name, parameter in current_named.items():
+            parameter.copy_(reference_state_cpu[name].to(device=device, dtype=parameter.dtype))
+    frozen_grad_count = sum(
+        p.requires_grad for module in (bagel, vae, flexae) for p in module.parameters() if id(p) not in lora_ids
+    )
+    if frozen_grad_count:
+        raise RuntimeError(f"freeze audit failed: {frozen_grad_count} frozen parameters require grad")
+    parameter_groups = bridge_parameter_groups(model.bridge, args)
+    if lora_parameters:
+        parameter_groups.append({"params": lora_parameters, "lr": args.lora_lr, "name": "understanding_lora"})
+    parameter_groups.append({
+        "params": encoder_parameters,
+        "lr": args.extractor_lr,
+        "betas": (0.9, 0.95),
+        "name": "flexae_encoder",
+    })
+    optimizer = torch.optim.AdamW([
+        *parameter_groups,
+    ], weight_decay=0.0, fused=args.fused_adamw)
+    optimizer_ids = {id(parameter) for group in optimizer.param_groups for parameter in group["params"]}
+    trainable_ids = {id(parameter) for parameter in model.bridge.parameters()} | lora_ids | {
+        id(parameter) for parameter in encoder_parameters
+    }
+    if sum(len(group["params"]) for group in parameter_groups) != len(optimizer_ids):
+        raise RuntimeError("duplicate bridge parameter registration across optimizer groups")
+    if optimizer_ids != trainable_ids:
+        raise RuntimeError(f"optimizer/trainable mismatch: optimizer={len(optimizer_ids)} expected={len(trainable_ids)}")
+
+    schedule_max_steps = args.schedule_max_steps or args.max_steps
+    if schedule_max_steps < args.max_steps:
+        raise ValueError("schedule_max_steps cannot be less than max_steps")
+    if args.resume_ramp_steps < 0:
+        raise ValueError("resume_ramp_steps cannot be negative")
+    if (args.resume_ramp_start_step is None) != (args.resume_ramp_steps == 0):
+        raise ValueError("resume ramp requires both a start step and a positive length")
+
+    def lr_lambda(step: int) -> float:
+        return resumed_lr_factor(
+            step,
+            args.warmup_steps,
+            schedule_max_steps,
+            args.min_lr_ratio,
+            args.resume_ramp_start_step,
+            args.resume_ramp_steps,
+        )
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    start_step = 0
+
+    def enable_flexae_encoder() -> None:
+        nonlocal encoder_trainable
+        if encoder_trainable:
+            return
+        for name in ("source_embed", "encoder", "g_projector"):
+            getattr(flexae, name).requires_grad_(True)
+        flexae.encoder_query.requires_grad_(True)
+        flexae.train()
+        for name in ("local_head", "g_to_decoder", "decoder", "patch_head"):
+            getattr(flexae, name).eval()
+        encoder_trainable = True
+        if rank == 0:
+            print(json.dumps({"event": "flexae_encoder_unfrozen", "step": args.encoder_unfreeze_step}), flush=True)
+
+    if args.resume:
+        candidates: list[tuple[int, Path]] = []
+        for checkpoint in output.glob("checkpoint-*"):
+            result = complete_checkpoint(checkpoint, args.stage, world_size)
+            if result is not None:
+                candidates.append((result[0], checkpoint))
+        if candidates:
+            start_step, checkpoint = max(candidates)
+            model.bridge.load_state_dict(load_file(checkpoint / "bridge.safetensors"), strict=True)
+            if args.stage in {"stage2", "stage3"}:
+                load_understanding_lora_state(model.bagel, load_file(checkpoint / "understanding_lora.safetensors"))
+            flexae_artifact = checkpoint / "flexae.safetensors"
+            if flexae_artifact.is_file():
+                flexae.load_state_dict(load_file(flexae_artifact), strict=True)
+            state = torch.load(checkpoint / "optimizer.pt", map_location="cpu", weights_only=False)
+            optimizer.load_state_dict(state["optimizer"])
+            scheduler.load_state_dict(state["scheduler"])
+            rng_state = torch.load(checkpoint / f"rng_rank{rank}.pt", map_location="cpu", weights_only=False)
+            random.setstate(rng_state["python"])
+            torch.set_rng_state(rng_state["torch_cpu"])
+            torch.cuda.set_rng_state(rng_state["torch_cuda"], device=device)
+            if rank == 0:
+                print(json.dumps({"event": "resume", "step": start_step, "checkpoint": str(checkpoint)}), flush=True)
+    if start_step >= args.encoder_unfreeze_step:
+        enable_flexae_encoder()
+
+    balanced_indices: array | None = None
+    balanced_metadata: dict[str, Any] | None = None
+    if args.balanced_order:
+        prefix = Path(args.balanced_order)
+        binary = prefix.with_suffix(".bin")
+        metadata_path = prefix.with_suffix(".json")
+        balanced_metadata = json.loads(metadata_path.read_text())
+        base_step = int(balanced_metadata["resume_step"])
+        balanced_indices = array("I")
+        with binary.open("rb") as handle:
+            balanced_indices.fromfile(handle, int(balanced_metadata["order_entries"]))
+        if rank == 0:
+            print(json.dumps({
+                "event": "launch_shuffle_loaded",
+                "base_step": base_step,
+                "start_step": start_step,
+                "entries": len(balanced_indices),
+            }), flush=True)
+
+    trainable_parameters = sum(p.numel() for p in model.bridge.parameters()) + sum(p.numel() for p in lora_parameters)
+    if rank == 0:
+        config = {
+            **vars(args),
+            "schema": RUN_SCHEMA,
+            "architecture_id": ARCHITECTURE_ID,
+            "world_size": world_size,
+            "global_effective_batch": world_size * args.micro_batch_size * args.gradient_accumulation,
+            "manifest_rows": len(manifest),
+            "val_rows": len(val_manifest),
+            "trainable_parameters": trainable_parameters,
+            "sampler_layers": list(SAMPLER_LAYERS),
+            "model_width": WIDTH,
+            "work_width": WORK_WIDTH,
+            "attention_heads": 16,
+            "g_tokens": TOKENS,
+            "attention_scope": "global_256",
+            "activation_checkpoint_layers": activation_checkpoint_layers,
+            "component_parameters": {
+                name: sum(p.numel() for p in getattr(model.bridge, name).parameters())
+                for name in ("projector", "deep_samplers")
+            },
+            "flexae_sha256": sha256(args.flexae_checkpoint),
+            "bagel_frozen": True,
+            "vit_frozen": True,
+            "flexae_frozen": True,
+            "raw_g_projected": True,
+            "projector_init": "identity_from_stage1_raw_g",
+            "deep_query_source": "contextual_llm_language_hidden",
+            "answer_use": {
+                "enabled": args.real_drop_loss_weight > 0.0 or args.real_shuffle_loss_weight > 0.0,
+                "negative": "half_manifest_donor_g_only_for_shuffle_dpo",
+                "score": "mean_gold_answer_token_ce",
+                "real_drop_weight": args.real_drop_loss_weight,
+                "real_shuffle_weight": args.real_shuffle_loss_weight,
+                "real_negative_ratio": [args.dpo_real_weight, args.dpo_negative_weight],
+                "negative_gradient_cap_relative_to_real": args.dpo_negative_grad_cap,
+                "real_ce_loss_weight": args.real_ce_loss_weight,
+                "beta": args.answer_use_beta,
+                "llm_forwards_per_microbatch": 3,
+                "gradient": "manual_autograd_branch_sync_cap",
+                "shuffle_kl_weight": args.shuffle_kl_weight,
+                "shuffle_kl_schedule": (
+                    {"knots": [
+                        {"step": step, "weight": weight}
+                        for step, weight in zip(*shuffle_kl_schedule)
+                    ], "contract": "piecewise linear interpolation with inclusive knots"}
+                    if shuffle_kl_schedule is not None else None
+                ),
+                "drop_kl_weight": args.drop_kl_weight,
+                "drop_g_training_term": False,
+            },
+            "deep_pairing": {
+                "enabled": args.g_pair_loss_weight > 0.0,
+                "negative": "half_manifest_donor_g",
+                "score": "mean_smooth_bidirectional_query_key_alignment_across_10_layers",
+                "weight": args.g_pair_loss_weight,
+                "temperature": args.g_pair_temperature,
+            },
+            "entry_fuser": False,
+            "entry_fuser_contract": None,
+            "joint_lora_from_step_one": args.stage in {"stage2", "stage3"} and args.init_bridge_checkpoint is None,
+            "deep_post_attention_input": "attention_only",
+            "projected_g_position_embedding": "fixed_bagel_vit_2d",
+            "mask_u": {
+                "enabled": args.mask_u_prob > 0.0 or mask_u_schedule is not None,
+                "initial_probability": args.mask_u_prob,
+                "schedule": (
+                    {
+                        "probabilities": list(mask_u_schedule[0]),
+                        "boundaries": list(mask_u_schedule[1]),
+                        "horizon": mask_u_schedule_horizon,
+                        "step_contract": "inclusive_upper_bound_global_optimizer_step",
+                        "resume_contract": "derived_only_from_restored_global_optimizer_step",
+                    }
+                    if mask_u_schedule is not None else None
+                ),
+                "granularity": args.mask_u_granularity,
+                "train_only": False,
+                "masked_value": "zero_raw_u_keep_position_embedding",
+                "validation_masked": True,
+                "validation_views": ["clean_u", "whole_sample_zero_u"],
+            },
+            "lora": args.stage in {"stage2", "stage3"},
+            "understanding_lora_parameters": sum(p.numel() for p in lora_parameters),
+            "understanding_lora_tensors": len(lora_parameters),
+            "bridge_master_dtype_actual": str(
+                model.bridge.projector.calibrator.weight.dtype
+            ).replace("torch.", ""),
+            "lora_master_dtype_actual": (
+                str(lora_parameters[0].dtype).replace("torch.", "") if lora_parameters else None
+            ),
+            "position_embedding_additions": 2,
+            "deep_updated_positions": "prompt_and_teacher_forced_answer_language_tokens",
+            "loss": {
+                "formula": "0.1 * matched_sft + 0.5 * DPO(real>shuffleG,4:1), drop-DPO disabled; drop-KL and shuffle-KL are both 1.0; shuffle negative branch capped at 0.25x paired real branch",
+                "lambda_CE": args.real_ce_loss_weight,
+                "lambda_DPO": args.answer_use_loss_weight,
+                "lambda_KL_base": args.shuffle_kl_weight,
+                "metadata_weighting": False,
+                "relevance_filter": ">=3_before_order",
+                "answer_tokens_include_eos": True,
+            },
+            "validation_memory_contract": {
+                "ce_chunk_size": 256,
+                "drop_kl_logits": "answer_tokens_only_unchunked",
+                "optimizer_state_device": "cpu_during_validation",
+                "sample_order": "packed_length_long_short_pairs_rank_balanced",
+            },
+            "balanced_order_metadata": balanced_metadata,
+            "schedule_max_steps": schedule_max_steps,
+        }
+        (output / "config.json").write_text(json.dumps(config, indent=2, sort_keys=True) + "\n")
+    dist.barrier()
+    initial_path = output / "bridge_initial.safetensors"
+    if rank == 0 and not initial_path.is_file():
+        save_file(
+            {name: value.detach().cpu().contiguous() for name, value in model.bridge.state_dict().items()},
+            str(initial_path),
+        )
+    dist.barrier()
+    initial_state = load_file(str(initial_path)) if rank == 0 else {}
+    trainable = DistributedDataParallel(
+        model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False
+    ) if world_size > 1 else model
+
+    manifest_size = len(manifest)
+    mix_a = (2 * args.mix_seed + 1) % manifest_size or 1
+    while math.gcd(mix_a, manifest_size) != 1:
+        mix_a = (mix_a + 2) % manifest_size or 1
+    mix_b = args.mix_seed % manifest_size
+    final_val_limit = args.final_val_limit or args.val_limit
+    if final_val_limit < args.val_limit:
+        raise ValueError("final_val_limit cannot be less than val_limit")
+    optimizer.zero_grad(set_to_none=True)
+    optimized_parameters = [parameter for group in optimizer.param_groups for parameter in group["params"]]
+    start_time = time.monotonic()
+    timing = {"preprocess_wait": 0.0, "tower": 0.0, "model": 0.0}
+    prompt_truncations = 0
+    prefetch_pool = ThreadPoolExecutor(max_workers=args.prefetch_workers, thread_name_prefix="image-prefetch")
+    gradient_audit_steps = {
+        int(value) for value in args.gradient_audit_steps.split(",") if value.strip()
+    }
+    gradient_audit_dir = Path(args.gradient_audit_dir) if args.gradient_audit_dir else None
+    if gradient_audit_steps and gradient_audit_dir is None:
+        raise ValueError("gradient_audit_dir is required when gradient_audit_steps is set")
+    if rank == 0 and gradient_audit_dir is not None:
+        gradient_audit_dir.mkdir(parents=True, exist_ok=True)
+    telemetry = output / "train.jsonl"
+    skipped_telemetry = output / "skipped_steps.jsonl"
+
+    def estimate_packed_tokens(rows: list[dict[str, Any]]) -> int:
+        total = 0
+        for row in rows:
+            prompt_ids = tokenizer.encode(row["prompt"], return_tensors="pt")[0]
+            prompt_budget = args.max_prompt_tokens - 2
+            if prompt_ids.numel() > prompt_budget:
+                prompt_ids = prompt_ids[: prompt_budget // 2]
+                tail = tokenizer.encode(row["prompt"], return_tensors="pt")[0]
+                prompt_ids = torch.cat([prompt_ids, tail[-(prompt_budget - prompt_budget // 2):]])
+            answer_ids = tokenizer.encode(row["answer"], return_tensors="pt")[0]
+            # BOS/EOS around prompt, BOS before answer, EOS after answer.
+            total += TOKENS + 2 + int(prompt_ids.numel()) + 2 + int(answer_ids.numel()) + 1
+        return total
+
+    for step in range(start_step + 1, args.max_steps + 1):
+        if step >= args.encoder_unfreeze_step:
+            enable_flexae_encoder()
+        model.mask_u_prob = mask_u_probability_for_step(
+            step,
+            mask_u_schedule,
+            args.mask_u_prob,
+        )
+        effective_shuffle_kl_weight = (
+            args.shuffle_kl_weight
+            if shuffle_kl_schedule is None
+            else piecewise_shuffle_kl_weight_for_step(step, shuffle_kl_schedule)
+        )
+        ce_total = 0.0
+        objective_total = 0.0
+        metadata_weight_total = 0.0
+        answer_tokens_total = 0.0
+        selected_words = 0
+        skipped_rows = 0
+        mask_u_ratio_total = 0.0
+        deep_pair_loss_total = 0.0
+        real_deep_pair_score_total = 0.0
+        shuffled_deep_pair_score_total = 0.0
+        deep_pair_accuracy_total = 0.0
+        answer_use_loss_total = 0.0
+        shuffle_kl_loss_total = 0.0
+        reference_gap_total = 0.0
+        train_shuffle_ce_total = 0.0
+        train_gap_total = 0.0
+        train_drop_ce_total = 0.0
+        drop_cap_scale_total = 0.0
+        shuffle_cap_scale_total = 0.0
+        branch_buffers = {
+            name: [torch.zeros_like(parameter, device="cpu", dtype=torch.float32) for parameter in optimized_parameters]
+            for name in ("objective", "shuffle_kl", "shuffle_negative")
+        }
+        collect_drop_telemetry = step == 1 or step % args.logging_steps == 0
+        micro_rows = []
+        micro_donor_rows = []
+        for micro in range(args.gradient_accumulation):
+            if balanced_indices is not None and balanced_metadata is not None:
+                base_step = int(balanced_metadata["resume_step"])
+                position = (
+                    ((step - base_step - 1) * args.gradient_accumulation + micro)
+                    * world_size * args.micro_batch_size + rank * args.micro_batch_size
+                )
+                indexes = balanced_indices[position:position + args.micro_batch_size]
+                if len(indexes) != args.micro_batch_size:
+                    raise RuntimeError(f"balanced-order exhausted at step={step} micro={micro} rank={rank}")
+                rows = [manifest.get(index) for index in indexes]
+                donor_rows = [
+                    manifest.get((int(index) + manifest_size // 2) % manifest_size)
+                    for index in indexes
+                ] if (args.g_pair_loss_weight > 0.0 or args.answer_use_loss_weight > 0.0
+                       or args.real_drop_loss_weight > 0.0 or args.real_shuffle_loss_weight > 0.0) else []
+                skipped = 0
+            else:
+                serial = ((step - 1) * args.gradient_accumulation + micro) * world_size * args.micro_batch_size + rank * args.micro_batch_size
+                rows, skipped = select_rows(
+                    manifest, serial, mix_a, mix_b, args.micro_batch_size,
+                    args.max_answer_words, args.max_microbatch_words,
+                )
+                donor_rows = [
+                    manifest.get((mix_a * (serial + offset + 1) + mix_b) % manifest_size)
+                    for offset in range(len(rows))
+                ]
+            selected_words += sum(row["caption_words"] for row in rows)
+            skipped_rows += skipped
+            micro_rows.append(rows)
+            micro_donor_rows.append(donor_rows)
+        if args.max_packed_tokens is not None:
+            local_lengths = torch.tensor(
+                [estimate_packed_tokens(rows) for rows in micro_rows],
+                dtype=torch.int64, device=device,
+            )
+            local_max = int(local_lengths.max().item())
+            global_max_tensor = torch.tensor(local_max, dtype=torch.int64, device=device)
+            dist.all_reduce(global_max_tensor, op=dist.ReduceOp.MAX)
+            global_max = int(global_max_tensor.item())
+            if global_max > args.max_packed_tokens:
+                skip_record = {
+                    "event": "optimizer_step_skipped",
+                    "step": step,
+                    "max_packed_tokens": args.max_packed_tokens,
+                    "local_max_packed_tokens": local_max,
+                    "global_max_packed_tokens": global_max,
+                    "rank": rank,
+                    "reason": "packed_length_exceeds_safety_threshold",
+                }
+                raise RuntimeError(json.dumps(skip_record, sort_keys=True))
+        futures = [(
+            prefetch_pool.submit(preprocess_towers, [image_source(row) for row in rows]),
+            prefetch_pool.submit(preprocess_towers, [image_source(row) for row in donor_rows])
+            if donor_rows else None,
+        ) for rows, donor_rows in zip(micro_rows, micro_donor_rows, strict=True)]
+        for micro, (rows, future_pair) in enumerate(zip(micro_rows, futures, strict=True)):
+            clock = time.monotonic()
+            preprocessed = future_pair[0].result()
+            donor_preprocessed = future_pair[1].result() if future_pair[1] is not None else None
+            timing["preprocess_wait"] += time.monotonic() - clock
+            clock = time.monotonic()
+            raw_u, raw_g = extract_preprocessed(preprocessed)
+            if encoder_trainable and not args.native_lora_sft:
+                with torch.no_grad(), torch.autocast("cuda", dtype=BF16):
+                    latent = encode_images(vae, preprocessed[0].to(device), "mean")
+                    patches = patchify_latents(latent)
+                with torch.autocast("cuda", dtype=BF16):
+                    raw_g = encoder_forward(patches)
+            donor_g = None
+            if donor_preprocessed is not None:
+                _, donor_g = extract_preprocessed(donor_preprocessed)
+            timing["tower"] += time.monotonic() - clock
+            sync = trainable.no_sync() if isinstance(trainable, DistributedDataParallel) and micro + 1 < args.gradient_accumulation else nullcontext()
+            clock = time.monotonic()
+            with sync, torch.autocast("cuda", dtype=BF16):
+                if model.mask_u_granularity == "per_sample_per_vit_token":
+                    fixed_u_mask = (
+                        torch.rand(raw_u.shape[:2], device=raw_u.device)
+                        < model.mask_u_prob
+                    )
+                else:
+                    fixed_u_mask = (
+                        torch.rand(raw_u.shape[0], 1, device=raw_u.device)
+                        < model.mask_u_prob
+                    ).expand(raw_u.shape[0], raw_u.shape[1])
+                prompts = [row["prompt"] for row in rows]
+                answers = [row["answer"] for row in rows]
+                reference_gap = raw_u.new_zeros(raw_u.shape[0])
+                shuffled_deep_ratios = [0.0] * len(SAMPLER_LAYERS)
+                # Answer length is determined by the tokenizer, not by the
+                # model output. Avoid an otherwise redundant no-grad real
+                # forward before the three branches below.
+                expected_answer_lengths = torch.tensor(
+                    [len(model.tokenizer.encode(answer)) + 1 for answer in answers],
+                    device=raw_u.device,
+                    dtype=torch.float32,
+                )
+                real_deep_ratios = [0.0] * len(SAMPLER_LAYERS)
+                weights = torch.tensor(
+                    [metadata_weight(row) for row in rows],
+                    device=raw_u.device, dtype=raw_u.dtype,
+                )
+                # Relevance filtering is part of dataset preparation, not launch-time validation.
+                if args.g_pair_loss_weight != 0.0:
+                    raise RuntimeError("this experiment requires g-pair-loss-weight=0")
+                deep_pair_loss = raw_u.new_zeros(())
+                real_deep_pair_score = raw_u.new_zeros(raw_u.shape[0])
+                shuffled_deep_pair_score = raw_u.new_zeros(raw_u.shape[0])
+                real_deep_by_layer = raw_u.new_zeros(len(SAMPLER_LAYERS), raw_u.shape[0])
+                shuffled_deep_by_layer = real_deep_by_layer
+
+                def branch_gradients(scalar: torch.Tensor, retain_graph: bool = False) -> list[torch.Tensor]:
+                    active_parameters = [parameter for parameter in optimized_parameters if parameter.requires_grad]
+                    values = torch.autograd.grad(
+                        scalar, active_parameters, retain_graph=retain_graph, allow_unused=True,
+                    )
+                    # Accumulate locally across GA micro-steps. The three
+                    # branches are reduced together once below, avoiding 12
+                    # collectives per optimizer step.
+                    active_values = sync_gradients_bucketed(values, active_parameters, 1)
+                    by_id = {id(parameter): value for parameter, value in zip(active_parameters, active_values, strict=True)}
+                    return [
+                        by_id.get(id(parameter), torch.zeros(parameter.numel(), dtype=torch.float32).view_as(parameter))
+                        for parameter in optimized_parameters
+                    ]
+
+                # Keep the real graph alive while the two negative branches
+                # produce their detached coefficients. This reuses the same
+                # real forward for both the CE statistics and positive DPO
+                # gradient, removing the old fourth forward.
+                model.bridge.clear_context()
+                with disable_understanding_lora(model.bagel), torch.no_grad():
+                    reference_ce_sums, reference_lengths, reference_logits = trainable(
+                        raw_u, donor_g if donor_g is not None else raw_g,
+                        prompts, answers, mode="drop_g",
+                        capture_pair_scores=False,
+                        fixed_u_mask=fixed_u_mask,
+                        return_answer_logits=True,
+                    )
+                    model.bridge.clear_context()
+                need_answer_logits = args.answer_use_loss_weight > 0.0 or args.drop_kl_weight > 0.0 or effective_shuffle_kl_weight > 0.0
+                real_result = trainable(
+                    raw_u, raw_g, prompts, answers,
+                    capture_pair_scores=False,
+                    fixed_u_mask=fixed_u_mask,
+                    ce_chunk_size=None if need_answer_logits else 32,
+                    return_answer_logits=need_answer_logits,
+                )
+                if need_answer_logits:
+                    ce_sums, answer_lengths, real_logits = real_result
+                else:
+                    ce_sums, answer_lengths = real_result
+                    real_logits = None
+                if not torch.equal(answer_lengths, expected_answer_lengths):
+                    raise RuntimeError("real answer lengths changed")
+                token_mean_ce = ce_sums / answer_lengths
+                # Paper definition: per-sample mean answer-token CE, then
+                # apply lambda_CE. Metadata and sqrt-length weighting belong
+                # to older experiments and are excluded from paper-main.
+                objective = args.real_ce_loss_weight * token_mean_ce.mean()
+                expected_real_ce_value = token_mean_ce.detach()
+                expected_objective_value = objective.detach()
+                real_deep_ratios = list(model.bridge.last_deep_ratios)
+
+                # Drop-G has no training objective in this experiment. Keep
+                # its CE in emitted telemetry without building or traversing
+                # an otherwise dead autograd graph on every optimizer step.
+                drop_dpo_loss_value = raw_u.new_zeros(())
+                drop_token_mean_ce_value = expected_real_ce_value
+                if donor_g is None:
+                    raise RuntimeError("real/drop/shuffle DPO requires donor G")
+                shuffled_ce_sums, shuffled_lengths, shuffled_logits = trainable(
+                    raw_u, donor_g, prompts, answers,
+                    capture_pair_scores=False, fixed_u_mask=fixed_u_mask,
+                    return_answer_logits=True,
+                )
+                if not torch.equal(answer_lengths, shuffled_lengths):
+                    raise RuntimeError("real/shuffle answer lengths changed")
+                shuffled_token_mean_ce = shuffled_ce_sums / shuffled_lengths
+                shuffle_q = dpo_branch_coefficient(token_mean_ce, shuffled_token_mean_ce, args.answer_use_beta)
+                shuffle_dpo_loss = F.softplus(-args.answer_use_beta * (shuffled_token_mean_ce - token_mean_ce)).mean()
+                shuffle_q_value = shuffle_q.detach()
+                shuffle_dpo_loss_value = shuffle_dpo_loss.detach()
+                shuffled_token_mean_ce_value = shuffled_token_mean_ce.detach()
+                shuffle_kl_loss = forward_kl_loss(shuffled_logits, reference_logits)
+                shuffle_kl_loss_value = shuffle_kl_loss.detach()
+                shuffle_negative_values = branch_gradients(
+                    -args.real_shuffle_loss_weight * args.dpo_negative_weight
+                    * (shuffle_q_value * shuffled_token_mean_ce).mean(),
+                    retain_graph=True,
+                )
+                shuffle_kl_values = branch_gradients(effective_shuffle_kl_weight * shuffle_kl_loss)
+                model.bridge.clear_context()
+                del shuffled_ce_sums, shuffled_lengths, shuffled_logits, shuffled_token_mean_ce, shuffle_q, shuffle_dpo_loss, shuffle_kl_loss
+                # Use one positive real gradient for objective plus both DPO
+                # branches. It is the cap reference for both negatives.
+                objective_values = branch_gradients(
+                    objective
+                    + args.real_shuffle_loss_weight * args.dpo_real_weight
+                    * (shuffle_q_value * token_mean_ce).mean()
+                )
+                model.bridge.clear_context()
+                del ce_sums, answer_lengths, real_logits, reference_ce_sums, reference_lengths, reference_logits, token_mean_ce, objective
+                torch.cuda.empty_cache()
+                if collect_drop_telemetry:
+                    with torch.no_grad():
+                        drop_ce_sums, drop_lengths = trainable(
+                            raw_u.detach(), raw_g.detach(), prompts, answers, mode="drop_g",
+                            capture_pair_scores=False, fixed_u_mask=fixed_u_mask,
+                            return_answer_logits=False, ce_chunk_size=32,
+                        )
+                    drop_token_mean_ce_value = (drop_ce_sums / drop_lengths).detach()
+                    model.bridge.clear_context()
+                    del drop_ce_sums, drop_lengths
+                for buffer, value in zip(branch_buffers["objective"], objective_values, strict=True):
+                    buffer.add_(value)
+                for buffer, value in zip(branch_buffers["shuffle_kl"], shuffle_kl_values, strict=True):
+                    buffer.add_(value)
+                for buffer, value in zip(branch_buffers["shuffle_negative"], shuffle_negative_values, strict=True):
+                    buffer.add_(value)
+                model.bridge.clear_context()
+            timing["model"] += time.monotonic() - clock
+            prompt_truncations += model.last_prompt_truncations
+            mask_u_ratio_total += model.last_u_mask_ratio / args.gradient_accumulation
+            ce_total += float(expected_real_ce_value.mean()) / args.gradient_accumulation
+            objective_total += float(expected_objective_value) / args.gradient_accumulation
+            deep_pair_loss_total += float(deep_pair_loss.detach()) / args.gradient_accumulation
+            real_deep_pair_score_total += float(
+                real_deep_pair_score.detach().mean()
+            ) / args.gradient_accumulation
+            shuffled_deep_pair_score_total += float(
+                shuffled_deep_pair_score.detach().mean()
+            ) / args.gradient_accumulation
+            deep_pair_accuracy_total += float(
+                (real_deep_pair_score.detach() > shuffled_deep_pair_score.detach()).float().mean()
+            ) / args.gradient_accumulation
+            answer_use_loss_total += float(
+                args.real_drop_loss_weight * drop_dpo_loss_value
+                + args.real_shuffle_loss_weight * shuffle_dpo_loss_value
+            ) / args.gradient_accumulation
+            shuffle_kl_loss_total += float(shuffle_kl_loss_value) / args.gradient_accumulation
+            reference_gap_total += float(reference_gap.detach().mean()) / args.gradient_accumulation
+            train_shuffle_ce_total += float(
+                shuffled_token_mean_ce_value.mean()
+            ) / args.gradient_accumulation
+            train_drop_ce_total += float(drop_token_mean_ce_value.mean()) / args.gradient_accumulation
+            train_gap_total += float(
+                (shuffled_token_mean_ce_value - expected_real_ce_value).mean()
+            ) / args.gradient_accumulation
+            metadata_weight_total += float(weights.detach().mean()) / args.gradient_accumulation
+            answer_tokens_total += float(expected_answer_lengths.mean()) / args.gradient_accumulation
+
+        all_reduce_branch_buffers_bucketed(
+            branch_buffers, optimized_parameters, world_size, device,
+        )
+        drop_cap_scale = 1.0
+        shuffle_cap_scale = gradient_buffer_cap_scale(
+            branch_buffers["shuffle_negative"],
+            branch_buffers["objective"],
+            args.dpo_negative_grad_cap,
+        )
+        for index, parameter in enumerate(optimized_parameters):
+            parameter.grad = (
+                branch_buffers["objective"][index]
+                + branch_buffers["shuffle_kl"][index]
+                + branch_buffers["shuffle_negative"][index] * shuffle_cap_scale
+            ).to(device=parameter.device, dtype=parameter.dtype) / args.gradient_accumulation
+        drop_cap_scale_total = float(drop_cap_scale)
+        shuffle_cap_scale_total = float(shuffle_cap_scale)
+
+        frozen_bagel_gradient_count = sum(
+            parameter.grad is not None for parameter in model.bagel.parameters() if id(parameter) not in lora_ids
+        )
+        lora_gradient_count = sum(parameter.grad is not None for parameter in lora_parameters)
+        encoder_gradient_count = sum(parameter.grad is not None for parameter in encoder_parameters)
+        if frozen_bagel_gradient_count:
+            raise RuntimeError(f"frozen BAGEL received {frozen_bagel_gradient_count} parameter gradients")
+        if args.stage in {"stage2", "stage3"} and lora_gradient_count != len(lora_parameters):
+            raise RuntimeError(f"LoRA gradient coverage mismatch: {lora_gradient_count}/{len(lora_parameters)}")
+        if encoder_trainable and encoder_gradient_count == 0:
+            raise RuntimeError("FlexAE encoder received no gradient after the paper unfreeze step")
+
+        def component_grad_norm(component: nn.Module) -> float:
+            terms = [p.grad.detach().float().square().sum() for p in component.parameters() if p.grad is not None]
+            return float(torch.sqrt(torch.stack(terms).sum())) if terms else 0.0
+
+        component_grad_norms = {
+            "projector": component_grad_norm(model.bridge.projector),
+            "deep_samplers": component_grad_norm(model.bridge.deep_samplers),
+        }
+        if lora_parameters:
+            terms = [p.grad.detach().float().square().sum() for p in lora_parameters if p.grad is not None]
+            component_grad_norms["understanding_lora"] = float(torch.sqrt(torch.stack(terms).sum()))
+        sampler_up_grads = [sampler.up.weight.grad for sampler in model.bridge.deep_samplers]
+        if any(value is None or float(value.detach().float().norm()) <= 0.0 for value in sampler_up_grads):
+            sampler_up_grad_norms = [
+                None if value is None else float(value.detach().float().norm())
+                for value in sampler_up_grads
+            ]
+            raise RuntimeError(
+                "one or more deep sampler zero-init outputs did not receive gradient: "
+                f"{sampler_up_grad_norms}"
+            )
+        if step >= 3 and any(
+            component_grad_norms[name] <= 0.0
+            for name in ("projector", "deep_samplers")
+        ):
+            raise RuntimeError(f"bridge gradient chain still locked at step {step}: {component_grad_norms}")
+        if rank == 0 and step in gradient_audit_steps and gradient_audit_dir is not None:
+            gradient_path = gradient_audit_dir / f"gradients-step-{step}.safetensors"
+            save_file({
+                name: parameter.grad.detach().cpu().contiguous()
+                for name, parameter in model.bridge.named_parameters()
+                if parameter.grad is not None
+            }, str(gradient_path))
+            audit_record = {
+                "event": "gradient_audit_saved",
+                "step": step,
+                "path": str(gradient_path),
+                "sha256": sha256(str(gradient_path)),
+                "component_grad_norms": component_grad_norms,
+                "frozen_bagel_gradient_count": frozen_bagel_gradient_count,
+                "understanding_lora_gradient_count": lora_gradient_count,
+                "flexae_encoder_gradient_count": encoder_gradient_count,
+            }
+            atomic_jsonl(gradient_audit_dir / "audit.jsonl", audit_record)
+            print(json.dumps(audit_record, sort_keys=True), flush=True)
+        optimized_parameters = [parameter for group in optimizer.param_groups for parameter in group["params"]]
+        grad_norm = float(torch.nn.utils.clip_grad_norm_(optimized_parameters, args.max_grad_norm))
+        if not math.isfinite(grad_norm):
+            raise FloatingPointError(f"non-finite gradient at step {step}: {grad_norm}")
+        optimizer.step()
+        scheduler.step()
+        optimizer.zero_grad(set_to_none=True)
+        values = torch.tensor([
+            ce_total, objective_total, grad_norm,
+            metadata_weight_total, answer_tokens_total, mask_u_ratio_total,
+            deep_pair_loss_total, real_deep_pair_score_total,
+            shuffled_deep_pair_score_total, deep_pair_accuracy_total,
+            answer_use_loss_total, train_shuffle_ce_total, train_gap_total,
+            shuffle_kl_loss_total, reference_gap_total, train_drop_ce_total,
+            drop_cap_scale_total, shuffle_cap_scale_total,
+        ], dtype=torch.float64, device=device)
+        dist.all_reduce(values)
+        values.div_(world_size)
+        if rank == 0 and (step == 1 or step % args.logging_steps == 0):
+            record = {
+                "event": "train", "step": step,
+                "caption_ce": float(values[0]),
+                "weighted_sqrt_length_objective": float(values[1]),
+                "grad_norm": float(values[2]),
+                "metadata_weight_mean": float(values[3]),
+                "answer_tokens_mean": float(values[4]),
+                "mask_u_probability": model.mask_u_prob,
+                "mask_u_ratio": float(values[5]),
+                "deep_pair_loss": float(values[6]),
+                "real_deep_pair_score": float(values[7]),
+                "shuffled_deep_pair_score": float(values[8]),
+                "deep_pair_accuracy": float(values[9]),
+                "real_deep_pair_scores_by_layer": [
+                    float(value) for value in real_deep_by_layer.detach().mean(dim=1)
+                ],
+                "shuffled_deep_pair_scores_by_layer": [
+                    float(value) for value in shuffled_deep_by_layer.detach().mean(dim=1)
+                ],
+                "answer_use_loss": float(values[10]),
+                "shuffle_caption_ce": float(values[11]),
+                "train_real_shuffle_gap": float(values[12]),
+                "shuffle_reference_kl": float(values[13]),
+                "effective_shuffle_kl_weight": effective_shuffle_kl_weight,
+                "reference_real_shuffle_gap": float(values[14]),
+                "drop_caption_ce": float(values[15]),
+                "real_drop_gap": float(values[15] - values[0]),
+                "drop_branch_cap_scale": float(values[16]),
+                "shuffle_branch_cap_scale": float(values[17]),
+                "dpo_gap_improvement": float(values[12] - values[14]),
+                "learning_rates": {group["name"]: group["lr"] for group in optimizer.param_groups},
+                "component_grad_norms": component_grad_norms,
+                "entry_residual_rms_ratio": model.bridge.last_entry_ratio,
+                "deep_residual_rms_ratios": real_deep_ratios,
+                "shuffle_deep_residual_rms_ratios": shuffled_deep_ratios,
+                "frozen_bagel_gradient_count": frozen_bagel_gradient_count,
+                "understanding_lora_gradient_count": lora_gradient_count,
+                "prompt_truncations": prompt_truncations,
+                "timing_seconds": timing,
+                "selected_caption_words": selected_words, "selection_skips": skipped_rows,
+                "seconds": time.monotonic() - start_time,
+                "peak_allocated_gib": torch.cuda.max_memory_allocated() / 2**30,
+            }
+            atomic_jsonl(telemetry, record)
+            print(json.dumps(record, sort_keys=True), flush=True)
+            start_time = time.monotonic()
+            timing = {"preprocess_wait": 0.0, "tower": 0.0, "model": 0.0}
+            prompt_truncations = 0
+
+        if step % args.save_steps == 0 or step == args.max_steps:
+            dist.barrier()
+            move_optimizer_state(optimizer, "cpu")
+            torch.cuda.empty_cache()
+            current_val_count = min(
+                final_val_limit if step == args.max_steps else args.val_limit,
+                len(val_manifest),
+            )
+            validation, validation_records = validate_distributed(
+                model, val_manifest, current_val_count, extract_towers,
+                args.val_batch_size, rank, world_size,
+            )
+            if rank == 0:
+                assert validation is not None and validation_records is not None
+                validation = {"event": "validation", "step": step, **validation}
+                validation["update_audit"] = parameter_update_audit(model.bridge, initial_state, optimizer)
+                samples_path = output / f"validation-step-{step}-samples.jsonl"
+                temporary_samples = samples_path.with_suffix(".jsonl.tmp")
+                temporary_samples.write_text(
+                    "".join(json.dumps(row, sort_keys=True) + "\n" for row in validation_records),
+                    encoding="utf-8",
+                )
+                os.replace(temporary_samples, samples_path)
+                validation["per_sample_path"] = str(samples_path)
+                validation["per_sample_sha256"] = sha256(str(samples_path))
+                atomic_jsonl(output / "validation.jsonl", validation)
+                print(json.dumps(validation, sort_keys=True), flush=True)
+            local_rng = {
+                "python": random.getstate(),
+                "torch_cpu": torch.get_rng_state(),
+                "torch_cuda": torch.cuda.get_rng_state(device),
+            }
+            gathered_rng: list[dict[str, Any]] | None = [None] * world_size if rank == 0 else None
+            dist.gather_object(local_rng, gathered_rng, dst=0)
+            if rank == 0:
+                assert gathered_rng is not None
+                atomic_checkpoint(
+                    output,
+                    step,
+                    trainable,
+                    optimizer,
+                    scheduler,
+                    validation,
+                    gathered_rng,
+                    args.stage,
+                    mask_u_schedule,
+                    flexae=flexae,
+                )
+                decision = retain_checkpoints(output, args.stage, world_size, args.keep_latest)
+                print(json.dumps({"event": "checkpoint_retention", **decision}, sort_keys=True), flush=True)
+            dist.barrier()
+            move_optimizer_state(optimizer, device)
+            torch.cuda.empty_cache()
+
+    if rank == 0:
+        save_file(
+            {name: value.detach().cpu().contiguous() for name, value in model.bridge.state_dict().items()},
+            str(output / "bridge_final.safetensors"),
+        )
+        if args.stage in {"stage2", "stage3"}:
+            save_file(understanding_lora_state_dict(model.bagel), str(output / "understanding_lora_final.safetensors"))
+        save_file(
+            {name: value.detach().cpu().contiguous() for name, value in flexae.state_dict().items()},
+            str(output / "flexae_final.safetensors"),
+        )
+        (output / "complete.json").write_text(json.dumps({
+            "schema": RUN_SCHEMA, "stage": args.stage, "step": args.max_steps,
+            "architecture_id": ARCHITECTURE_ID,
+            "trainable_parameters": trainable_parameters,
+        }, indent=2) + "\n")
+    prefetch_pool.shutdown(wait=True)
+    dist.barrier()
+    dist.destroy_process_group()
+
+
+if __name__ == "__main__":
+    main()

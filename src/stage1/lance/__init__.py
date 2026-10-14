@@ -1,0 +1,1 @@
+"""GAFU training package."""

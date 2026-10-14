@@ -1,0 +1,69 @@
+model: lance
+runtime:
+  python: python
+  gpus: 0,1,2,3,4,5,6,7
+assets:
+  root: ../assets
+stage1:
+  data:
+    train: /path/to/Finevision_Batch1_Train/DATASET_MANIFEST.json
+    validation: /path/to/Finevision_Validation/DATASET_MANIFEST.json
+  output_dir: ../runs/gafu_lance_stage1
+  training:
+    max_steps: 8000
+    micro_batch_size: 4
+    gradient_accumulation: 1
+    learning_rate: 0.0001
+    min_lr_ratio: 0.1
+    warmup_steps: 200
+    weight_decay: 0.01
+    max_grad_norm: 1.0
+    native_loss_weight: 0.25
+    binding_loss_weight: 1.0
+    global_relation_weight: 0.137
+    local_relation_weight: 1.34
+    relation_ramp_steps: 100
+    relation_initial_scale: 0.2
+    save_steps: 250
+    logging_steps: 10
+    val_limit: 64
+    seed: 20261002
+    shuffle_seed: 20261002
+    smoke_steps: 2
+stage2:
+  data:
+    train: /path/to/FineVision_Batch1_Train/DATASET_MANIFEST.json
+    validation: /path/to/FineVision_Validation/DATASET_MANIFEST.json
+  output_dir: ../runs/gafu_lance_stage2
+  training:
+    max_steps: 5000
+    encoder_unfreeze_step: 2501
+    micro_batch_size: 1
+    gradient_accumulation: 4
+    global_batch: 32
+    warmup_steps: 500
+    min_lr_ratio: 0.1
+    projector_lr: 2.0e-05
+    sampler_lr: 2.0e-05
+    extractor_lr: 0.0001
+    lora_lr: 0.0001
+    lora_rank: 16
+    lora_alpha: 16
+    lambda_ce: 5.0
+    lambda_dpo: 1.0
+    dpo_real_weight: 4.0
+    dpo_negative_weight: 1.0
+    dpo_negative_grad_cap: 0.25
+    dpo_beta: 0.1
+    shuffle_kl_weight: 1.0
+    shuffle_kl_schedule_steps: 1,1875,2188,2500,5000
+    shuffle_kl_schedule_weights: 1,1,0.25,0.25,0
+    drop_kl_weight: 0.0
+    mask_u_schedule: 0.8,0.5,0.2,0.0
+    mask_u_schedule_boundaries: 1250,2500,3750,5000
+    max_grad_norm: 1.0
+    save_steps: 250
+    val_limit: 512
+    seed: 20261002
+    shuffle_seed: 20260808
+    smoke_steps: 2

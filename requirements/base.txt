@@ -1,0 +1,9 @@
+torch==2.5.1
+torchvision==0.20.1
+PyYAML==6.0.2
+Pillow==11.3.0
+safetensors==0.4.5
+pyarrow==11.0.0
+numpy==1.24.4
+einops==0.8.1
+huggingface_hub>=0.26.0
