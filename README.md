@@ -6,7 +6,7 @@
 
 <!-- Replace PAPER_URL with the public paper link before release. -->
 <p align="center">
-  <a href="PAPER_URL">📄 Paper</a>
+  <a href="https://arxiv.org/abs/2610.23987">📄 Paper</a>
 </p>
 
 <p align="center">
@@ -131,10 +131,13 @@ GAFU consistently outperforms SFT baselines trained on the same downstream data.
 ## Citation
 
 ```bibtex
-@inproceedings{gafu2027,
-  title     = {What Generation Knows: Unlocking Fine-Grained Understanding in Unified Multimodal Models},
-  author    = {Anonymous Authors},
-  booktitle = {International Conference on Learning Representations},
-  year      = {2027}
+@misc{ru2026generationknowsunlockingfinegrained,
+      title={What Generation Knows: Unlocking Fine-Grained Understanding in Unified Multimodal Models},
+      author={Tengju Ru and Weitong Lian and Zecong Tang and Zhiheng Liu and Lingyi Meng and Haoran Li and Kaixuan Wang and Bohao Li and Xihui Liu},
+      year={2026},
+      eprint={2610.23987},
+      archivePrefix={arXiv},
+      primaryClass={cs.CV},
+      url={https://arxiv.org/abs/2610.23987},
 }
 ```
